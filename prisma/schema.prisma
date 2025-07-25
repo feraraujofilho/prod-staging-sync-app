@@ -30,3 +30,39 @@ model Session {
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
 }
+
+model StoreConnection {
+  id              String    @id @default(cuid())
+  shop            String    // The shop that owns this connection
+  name            String    // Friendly name for the connection
+  storeDomain     String    // Production store domain
+  encryptedToken  String    // Encrypted access token
+  environment     String    @default("production") // production, staging, etc.
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Relations
+  syncLogs        SyncLog[]
+
+  @@unique([shop, storeDomain])
+  @@index([shop])
+}
+
+model SyncLog {
+  id              String    @id @default(cuid())
+  shop            String
+  connectionId    String
+  syncType        String    // metafield_definitions, products, etc.
+  status          String    // success, partial, failed
+  summary         String?   // JSON summary of results
+  logs            String?   // JSON array of log entries
+  startedAt       DateTime  @default(now())
+  completedAt     DateTime?
+
+  // Relations
+  connection      StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([shop, syncType])
+  @@index([connectionId])
+}
