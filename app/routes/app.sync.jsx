@@ -43,6 +43,8 @@ import prisma from "../db.server";
 import { syncMetafieldDefinitions } from "../services/sync.metafields.server";
 import { syncMetaobjectDefinitions } from "../services/sync.metaobjects.server";
 import { syncImageFiles } from "../services/sync.files.server";
+import { syncNavigationMenus } from "../services/sync.navigation.server";
+import { syncPages } from "../services/sync.pages.server";
 
 // Loader to fetch connections and recent sync logs
 export const loader = async ({ request }) => {
@@ -165,6 +167,18 @@ export const action = async ({ request }) => {
         );
         break;
 
+      case "navigation":
+        result = await syncNavigationMenus(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+        );
+        break;
+
+      case "pages":
+        result = await syncPages(connection.storeDomain, decryptedToken, admin);
+        break;
+
       default:
         result = {
           success: false,
@@ -172,18 +186,38 @@ export const action = async ({ request }) => {
         };
     }
 
+    // Determine success based on summary data
+    const hasErrors =
+      result.summary?.errors && result.summary.errors.length > 0;
+    const hasSuccess =
+      result.summary?.created > 0 || result.summary?.updated > 0;
+
+    // Determine status: success, partially successful, or failed
+    let status = "failed";
+    if (hasSuccess && hasErrors) {
+      status = "partially_successful";
+    } else if (
+      hasSuccess ||
+      (!hasErrors && (result.summary?.total > 0 || result.summary?.skipped > 0))
+    ) {
+      status = "success";
+    }
+
     // Update sync log with results
     await prisma.syncLog.update({
       where: { id: syncLog.id },
       data: {
-        status: result.success ? "success" : "failed",
+        status: status,
         summary: JSON.stringify(result.summary || {}),
         logs: JSON.stringify(result.logs || []),
         completedAt: new Date(),
       },
     });
 
-    return result;
+    return {
+      ...result,
+      success: status === "success" || status === "partially_successful",
+    };
   } catch (error) {
     // Update sync log with error
     await prisma.syncLog.update({
@@ -224,6 +258,20 @@ const SYNC_TYPES = [
     description:
       "Sync images uploaded in theme editor (excludes product images)",
     icon: ImageIcon,
+    available: true,
+  },
+  {
+    id: "navigation",
+    label: "Navigation Menus",
+    description: "Sync navigation menus and their structure",
+    icon: SettingsIcon,
+    available: true,
+  },
+  {
+    id: "pages",
+    label: "Pages",
+    description: "Sync online store pages and their content",
+    icon: ProfileIcon,
     available: true,
   },
   {
@@ -490,6 +538,28 @@ export default function DataSync() {
                         </Text>
 
                         <BlockStack gap="300">
+                          <Box
+                            padding="300"
+                            borderRadius="200"
+                            background="bg-info-subdued"
+                          >
+                            <InlineStack gap="300" blockAlign="center">
+                              <Icon source={SettingsIcon} color="info" />
+                              <Text variant="bodySm" color="subdued">
+                                Configure navigation menu sync settings in{" "}
+                                <a
+                                  href="/app/navigation-config"
+                                  style={{
+                                    color: "inherit",
+                                    textDecoration: "underline",
+                                  }}
+                                >
+                                  Navigation Settings
+                                </a>
+                              </Text>
+                            </InlineStack>
+                          </Box>
+
                           {SYNC_TYPES.map((syncType) => (
                             <Box
                               key={syncType.id}
@@ -583,11 +653,13 @@ export default function DataSync() {
                               "text",
                               "text",
                               "text",
+                              "text",
                             ]}
                             headings={[
                               "Type",
                               "Source",
                               "Status",
+                              "Summary",
                               "Started",
                               "Duration",
                               "Actions",
@@ -601,6 +673,29 @@ export default function DataSync() {
                                   )
                                 : null;
 
+                              // Parse summary for display
+                              let summaryText = "No data";
+                              try {
+                                const summary = JSON.parse(log.summary || "{}");
+                                if (summary.total !== undefined) {
+                                  const parts = [];
+                                  if (summary.created > 0)
+                                    parts.push(`${summary.created} created`);
+                                  if (summary.updated > 0)
+                                    parts.push(`${summary.updated} updated`);
+                                  if (summary.skipped > 0)
+                                    parts.push(`${summary.skipped} skipped`);
+                                  if (summary.failed > 0)
+                                    parts.push(`${summary.failed} failed`);
+                                  summaryText =
+                                    parts.length > 0
+                                      ? parts.join(", ")
+                                      : `${summary.total} total`;
+                                }
+                              } catch (e) {
+                                summaryText = "Error parsing";
+                              }
+
                               return [
                                 log.syncType
                                   .replace(/_/g, " ")
@@ -610,13 +705,18 @@ export default function DataSync() {
                                   status={
                                     log.status === "success"
                                       ? "success"
-                                      : log.status === "failed"
-                                        ? "critical"
-                                        : "info"
+                                      : log.status === "partially_successful"
+                                        ? "warning"
+                                        : log.status === "failed"
+                                          ? "critical"
+                                          : "info"
                                   }
                                 >
-                                  {log.status}
+                                  {log.status === "partially_successful"
+                                    ? "partially successful"
+                                    : log.status}
                                 </Badge>,
+                                <Text variant="bodySm">{summaryText}</Text>,
                                 new Date(log.startedAt).toLocaleString(),
                                 duration ? `${duration}s` : "In progress",
                                 <Button
@@ -730,12 +830,16 @@ export default function DataSync() {
                     status={
                       selectedLogDetails.status === "success"
                         ? "success"
-                        : selectedLogDetails.status === "failed"
-                          ? "critical"
-                          : "info"
+                        : selectedLogDetails.status === "partially_successful"
+                          ? "warning"
+                          : selectedLogDetails.status === "failed"
+                            ? "critical"
+                            : "info"
                     }
                   >
-                    {selectedLogDetails.status}
+                    {selectedLogDetails.status === "partially_successful"
+                      ? "partially successful"
+                      : selectedLogDetails.status}
                   </Badge>
                 </InlineStack>
                 <InlineStack gap="400">
@@ -747,16 +851,36 @@ export default function DataSync() {
                   </Text>
                 </InlineStack>
                 {selectedLogDetails.completedAt && (
-                  <InlineStack gap="400">
-                    <Text variant="bodyMd" fontWeight="semibold">
-                      Completed:
-                    </Text>
-                    <Text variant="bodyMd">
-                      {new Date(
-                        selectedLogDetails.completedAt,
-                      ).toLocaleString()}
-                    </Text>
-                  </InlineStack>
+                  <>
+                    <InlineStack gap="400">
+                      <Text variant="bodyMd" fontWeight="semibold">
+                        Completed:
+                      </Text>
+                      <Text variant="bodyMd">
+                        {new Date(
+                          selectedLogDetails.completedAt,
+                        ).toLocaleString()}
+                      </Text>
+                    </InlineStack>
+                    <InlineStack gap="400">
+                      <Text variant="bodyMd" fontWeight="semibold">
+                        Duration:
+                      </Text>
+                      <Text variant="bodyMd">
+                        {(() => {
+                          const start = new Date(selectedLogDetails.startedAt);
+                          const end = new Date(selectedLogDetails.completedAt);
+                          const duration = end - start;
+                          const seconds = Math.floor(duration / 1000);
+                          const minutes = Math.floor(seconds / 60);
+                          const remainingSeconds = seconds % 60;
+                          return minutes > 0
+                            ? `${minutes}m ${remainingSeconds}s`
+                            : `${seconds}s`;
+                        })()}
+                      </Text>
+                    </InlineStack>
+                  </>
                 )}
               </BlockStack>
 
@@ -766,6 +890,9 @@ export default function DataSync() {
                     <BlockStack gap="300">
                       <Text variant="headingMd" as="h3">
                         Summary
+                      </Text>
+                      <Text variant="bodySm" color="subdued">
+                        Overview of sync operations and results
                       </Text>
                       <BlockStack gap="200">
                         {(() => {
@@ -800,17 +927,181 @@ export default function DataSync() {
                                 .replace(/\b\w/g, (l) => l.toUpperCase());
                             }
 
+                            // Handle different value types safely
+                            let displayValue = value;
+                            if (typeof value === "object" && value !== null) {
+                              if (key === "importedDefaultMenus") {
+                                displayValue = Array.isArray(value)
+                                  ? `${value.length} items`
+                                  : "Object";
+                              } else if (key === "errors") {
+                                // Display error messages properly
+                                if (Array.isArray(value)) {
+                                  displayValue = value.map((error, index) => (
+                                    <Text
+                                      key={index}
+                                      variant="bodySm"
+                                      color="critical"
+                                    >
+                                      • {error}
+                                    </Text>
+                                  ));
+                                } else {
+                                  displayValue = "Object";
+                                }
+                              } else {
+                                displayValue = JSON.stringify(value);
+                              }
+                            } else if (
+                              typeof value === "string" ||
+                              typeof value === "number"
+                            ) {
+                              displayValue = value;
+                            } else {
+                              displayValue = String(value);
+                            }
+
                             return (
-                              <InlineStack key={key} gap="200">
-                                <Text variant="bodyMd" fontWeight="semibold">
-                                  {displayKey}:
-                                </Text>
-                                <Text variant="bodyMd">{value}</Text>
-                              </InlineStack>
+                              <Box key={key}>
+                                <InlineStack gap="200">
+                                  <Text variant="bodyMd" fontWeight="semibold">
+                                    {displayKey}:
+                                  </Text>
+                                  {key === "errors" &&
+                                  Array.isArray(displayValue) ? (
+                                    <BlockStack gap="100">
+                                      {displayValue}
+                                    </BlockStack>
+                                  ) : (
+                                    <Text variant="bodyMd">{displayValue}</Text>
+                                  )}
+                                </InlineStack>
+                              </Box>
                             );
                           });
                         })()}
                       </BlockStack>
+                    </BlockStack>
+                  </Card>
+                )}
+
+              {/* Show key operations summary */}
+              {selectedLogDetails.parsedLogs &&
+                selectedLogDetails.parsedLogs.length > 0 && (
+                  <Card>
+                    <BlockStack gap="300">
+                      <Text variant="headingMd" as="h3">
+                        Key Operations
+                      </Text>
+                      <Text variant="bodySm" color="subdued">
+                        Most important operations from this sync run
+                      </Text>
+
+                      {/* Successful operations */}
+                      {(() => {
+                        const successfulOps =
+                          selectedLogDetails.parsedLogs.filter(
+                            (log) => log.success || log.message?.includes("✅"),
+                          );
+                        return successfulOps.length > 0 ? (
+                          <BlockStack gap="200">
+                            <Text
+                              variant="bodyMd"
+                              fontWeight="semibold"
+                              color="success"
+                            >
+                              ✅ Successful Operations ({successfulOps.length})
+                            </Text>
+                            <BlockStack gap="100">
+                              {successfulOps.slice(0, 5).map((log, index) => (
+                                <Text
+                                  key={index}
+                                  variant="bodySm"
+                                  color="success"
+                                >
+                                  • {log.message.replace(/^\[.*?\] /, "")}
+                                </Text>
+                              ))}
+                              {successfulOps.length > 5 && (
+                                <Text variant="bodySm" color="subdued">
+                                  ... and {successfulOps.length - 5} more
+                                  successful operations
+                                </Text>
+                              )}
+                            </BlockStack>
+                          </BlockStack>
+                        ) : null;
+                      })()}
+
+                      {/* Failed operations */}
+                      {(() => {
+                        const failedOps = selectedLogDetails.parsedLogs.filter(
+                          (log) => log.error || log.message?.includes("❌"),
+                        );
+                        return failedOps.length > 0 ? (
+                          <BlockStack gap="200">
+                            <Text
+                              variant="bodyMd"
+                              fontWeight="semibold"
+                              color="critical"
+                            >
+                              ❌ Failed Operations ({failedOps.length})
+                            </Text>
+                            <BlockStack gap="100">
+                              {failedOps.slice(0, 5).map((log, index) => (
+                                <Text
+                                  key={index}
+                                  variant="bodySm"
+                                  color="critical"
+                                >
+                                  • {log.message.replace(/^\[.*?\] /, "")}
+                                </Text>
+                              ))}
+                              {failedOps.length > 5 && (
+                                <Text variant="bodySm" color="subdued">
+                                  ... and {failedOps.length - 5} more failed
+                                  operations
+                                </Text>
+                              )}
+                            </BlockStack>
+                          </BlockStack>
+                        ) : null;
+                      })()}
+
+                      {/* Skipped operations */}
+                      {(() => {
+                        const skippedOps = selectedLogDetails.parsedLogs.filter(
+                          (log) => log.skipped || log.message?.includes("⚠️"),
+                        );
+                        return skippedOps.length > 0 ? (
+                          <BlockStack gap="200">
+                            <Text
+                              variant="bodyMd"
+                              fontWeight="semibold"
+                              color="caution"
+                            >
+                              ⚠️ Skipped Operations ({skippedOps.length})
+                            </Text>
+                            <BlockStack gap="100">
+                              {skippedOps.slice(0, 3).map((log, index) => (
+                                <Text
+                                  key={index}
+                                  variant="bodySm"
+                                  color="caution"
+                                >
+                                  • {log.message.replace(/^\[.*?\] /, "")}
+                                </Text>
+                              ))}
+                              {skippedOps.length > 3 && (
+                                <Text variant="bodySm" color="subdued">
+                                  ... and {skippedOps.length - 3} more skipped
+                                  operations
+                                </Text>
+                              )}
+                            </BlockStack>
+                          </BlockStack>
+                        ) : null;
+                      })()}
                     </BlockStack>
                   </Card>
                 )}
@@ -821,6 +1112,10 @@ export default function DataSync() {
                     <BlockStack gap="300">
                       <Text variant="headingMd" as="h3">
                         Detailed Logs
+                      </Text>
+                      <Text variant="bodySm" color="subdued">
+                        Showing {selectedLogDetails.parsedLogs.length}{" "}
+                        operations from this sync run
                       </Text>
                       <Scrollable style={{ height: "400px" }}>
                         <BlockStack gap="100">
@@ -848,6 +1143,20 @@ export default function DataSync() {
                     </BlockStack>
                   </Card>
                 )}
+
+              {(!selectedLogDetails.parsedLogs ||
+                selectedLogDetails.parsedLogs.length === 0) && (
+                <Card>
+                  <BlockStack gap="300">
+                    <Text variant="headingMd" as="h3">
+                      Detailed Logs
+                    </Text>
+                    <Text variant="bodyMd" color="subdued">
+                      No detailed logs available for this sync run
+                    </Text>
+                  </BlockStack>
+                </Card>
+              )}
             </BlockStack>
           )}
         </Modal.Section>
