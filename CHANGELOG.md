@@ -2,6 +2,22 @@
 
 All notable changes to the Production-Staging Sync App will be documented in this file.
 
+## [1.2.0] - 2025-07-25
+
+### Added
+
+- Theme image sync functionality
+- Sync images uploaded via theme editor (excludes product images)
+- Progress tracking for file sync operations
+- Duplicate file detection and skipping
+- `write_files` scope for file management
+- Prisma Studio integration for development workflow
+
+### Changed
+
+- Added `ImageIcon` for theme image sync UI
+- Updated documentation with file sync limitations
+
 ## [1.1.0] - 2025-07-25
 
 ### Added

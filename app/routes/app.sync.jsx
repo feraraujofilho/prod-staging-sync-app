@@ -36,11 +36,13 @@ import {
   OrderIcon,
   SettingsIcon,
   ImportIcon,
+  ImageIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { syncMetafieldDefinitions } from "../services/sync.metafields.server";
 import { syncMetaobjectDefinitions } from "../services/sync.metaobjects.server";
+import { syncImageFiles } from "../services/sync.files.server";
 
 // Loader to fetch connections and recent sync logs
 export const loader = async ({ request }) => {
@@ -78,7 +80,7 @@ export const loader = async ({ request }) => {
 
 // Action handler for sync operations
 export const action = async ({ request }) => {
-  // const { decrypt } = await import("../utils/encryption.server");
+  const { decrypt } = await import("../utils/encryption.server");
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
 
@@ -155,6 +157,14 @@ export const action = async ({ request }) => {
         };
         break;
 
+      case "files":
+        result = await syncImageFiles(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+        );
+        break;
+
       default:
         result = {
           success: false,
@@ -206,6 +216,14 @@ const SYNC_TYPES = [
     label: "Metaobject Definitions",
     description: "Sync metaobject definitions between stores",
     icon: ImportIcon,
+    available: true,
+  },
+  {
+    id: "files",
+    label: "Theme Images",
+    description:
+      "Sync images uploaded in theme editor (excludes product images)",
+    icon: ImageIcon,
     available: true,
   },
   {

@@ -7,6 +7,7 @@ A Shopify app that synchronizes metaobject and metafield definitions between pro
 - **Store Connection Management**: Connect multiple production stores to sync from
 - **Metaobject Definition Sync**: Sync custom metaobject schemas between stores
 - **Metafield Definition Sync**: Sync product metafield definitions between stores
+- **Theme Image Sync**: Sync images uploaded via theme editor (excludes product images)
 - **Secure Token Storage**: Encrypted storage of Shopify access tokens
 - **Detailed Sync Logs**: Track sync operations with comprehensive logging
 
@@ -143,6 +144,20 @@ Navigate to **Sync** to synchronize definitions:
 3. **Missing Scope**: The app needs appropriate scopes to create metafields
    - Metafield creation is based on namespace permissions, not a specific scope
 
+### Theme Image Sync Limitations
+
+1. **Theme Images Only**: Only syncs images uploaded via theme editor
+   - Product images are excluded from sync
+   - Only images in the Files section are synced
+
+2. **Filename Preservation**: Files are synced with their original filenames
+   - If a file with the same name exists, it will be skipped
+   - No automatic renaming or versioning
+
+3. **No ID Preservation**: Cannot preserve Shopify file IDs between environments
+   - File references in themes may need manual updates
+   - URLs will be different between production and staging
+
 ### General Limitations
 
 1. **One-Way Sync**: Only syncs from production to staging (not bidirectional)
@@ -254,6 +269,7 @@ app-staging/
 
 - `app/services/sync.metaobjects.server.js` - Metaobject sync logic
 - `app/services/sync.metafields.server.js` - Metafield sync logic
+- `app/services/sync.files.server.js` - Theme image sync logic
 - `app/utils/encryption.server.js` - Token encryption/decryption
 - `app/routes/app.sync.jsx` - Sync UI and actions
 - `app/routes/app.settings.jsx` - Store connection management

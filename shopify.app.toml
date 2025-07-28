@@ -3,7 +3,7 @@
 client_id = "8f5c558cd5afa2119088673e06cf3677"
 name = "app-staging"
 handle = "app-staging-3"
-application_url = "https://algebra-typing-subscriptions-tariff.trycloudflare.com"
+application_url = "https://warner-minor-est-oem.trycloudflare.com"
 embedded = true
 
 [build]
@@ -23,10 +23,10 @@ api_version = "2025-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,read_metaobject_definitions,write_metaobject_definitions"
+scopes = "write_products,read_metaobject_definitions,write_metaobject_definitions,write_files"
 
 [auth]
-redirect_urls = ["https://algebra-typing-subscriptions-tariff.trycloudflare.com/auth/callback", "https://algebra-typing-subscriptions-tariff.trycloudflare.com/auth/shopify/callback", "https://algebra-typing-subscriptions-tariff.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://warner-minor-est-oem.trycloudflare.com/auth/callback", "https://warner-minor-est-oem.trycloudflare.com/auth/shopify/callback", "https://warner-minor-est-oem.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false
