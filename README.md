@@ -10,6 +10,7 @@ A Shopify app that synchronizes metaobject and metafield definitions between pro
 - **Theme Image Sync**: Sync images uploaded via theme editor (excludes product images)
 - **Navigation Menu Sync**: Sync navigation menus and their nested structure
 - **Page Sync**: Sync online store pages and their content
+- **Market Sync**: Sync Shopify Markets configuration, conditions, and currency settings
 - **Secure Token Storage**: Encrypted storage of Shopify access tokens
 - **Detailed Sync Logs**: Track sync operations with comprehensive logging
 
@@ -194,6 +195,15 @@ Navigate to **Sync** to synchronize definitions:
 4. **Template Suffixes**: Page template suffixes are preserved
 5. **Metafields**: Page metafields are not currently synced (future enhancement)
 
+### Market Sync Limitations
+
+1. **Market Conditions**: Regional, location, and company location conditions are preserved
+2. **Currency Settings**: Base currency and local currency settings are synced
+3. **Web Presence**: Domain and subdomain configurations are maintained
+4. **Handle Conflicts**: Markets with existing handles are updated, new markets are created
+5. **API Version**: Uses latest GraphQL API (2025-07) for market operations
+6. **Required Scopes**: Requires `read_markets` and `write_markets` permissions
+
 ### General Limitations
 
 1. **One-Way Sync**: Only syncs from production to staging (not bidirectional)
@@ -230,6 +240,11 @@ Navigate to **Sync** to synchronize definitions:
 ### "Access denied for pages field"
 
 - **Cause**: App doesn't have the required `read_online_store_pages` scope
+- **Solution**: Reinstall the app to get the new scopes, or ensure the app has the correct permissions
+
+### "Access denied for markets field"
+
+- **Cause**: App doesn't have the required `read_markets` or `write_markets` scope
 - **Solution**: Reinstall the app to get the new scopes, or ensure the app has the correct permissions
 
 ### "Handle can't be changed in a default list"

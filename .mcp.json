@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "shopify-internal": {
+      "type": "stdio",
+      "command": "/opt/dev/bin/dev",
+      "args": ["mcp"]
+    },
+    "vault-set-search": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/uvx",
+      "args": ["vault-set-mcp"]
+    },
+    "browsermcp": {
+      "command": "npx",
+      "args": ["@browsermcp/mcp@latest"]
+    },
+    "data-portal": {
+      "command": "/opt/homebrew/bin/uvx",
+      "args": ["data-portal-mcp"]
+    },
+    "shopify-dev-mcp": {
+      "command": "npx",
+      "args": ["-y", "@shopify/dev-mcp@latest"]
+    }
+  }
+}

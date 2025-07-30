@@ -45,6 +45,7 @@ import { syncMetaobjectDefinitions } from "../services/sync.metaobjects.server";
 import { syncImageFiles } from "../services/sync.files.server";
 import { syncNavigationMenus } from "../services/sync.navigation.server";
 import { syncPages } from "../services/sync.pages.server";
+import { syncMarkets } from "../services/sync.markets.server";
 
 // Loader to fetch connections and recent sync logs
 export const loader = async ({ request }) => {
@@ -179,6 +180,14 @@ export const action = async ({ request }) => {
         result = await syncPages(connection.storeDomain, decryptedToken, admin);
         break;
 
+      case "markets":
+        result = await syncMarkets(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+        );
+        break;
+
       default:
         result = {
           success: false,
@@ -275,6 +284,13 @@ const SYNC_TYPES = [
     available: true,
   },
   {
+    id: "markets",
+    label: "Markets",
+    description: "Sync Shopify Markets configuration and settings",
+    icon: SettingsIcon,
+    available: true,
+  },
+  {
     id: "products",
     label: "Products",
     description: "Sync product catalog including variants and images",
@@ -286,20 +302,6 @@ const SYNC_TYPES = [
     label: "Collections",
     description: "Sync collections and their product associations",
     icon: CollectionIcon,
-    available: false,
-  },
-  {
-    id: "customers",
-    label: "Customers",
-    description: "Sync customer data and segments",
-    icon: ProfileIcon,
-    available: false,
-  },
-  {
-    id: "orders",
-    label: "Orders",
-    description: "Sync order history and fulfillment data",
-    icon: OrderIcon,
     available: false,
   },
 ];

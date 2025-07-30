@@ -2,6 +2,29 @@
 
 All notable changes to the Production-Staging Sync App will be documented in this file.
 
+## [1.5.0] - 2025-07-28
+
+### Added
+
+- Market sync functionality
+- Sync Shopify Markets configuration from production to staging
+- Support for market conditions (regional, location, company location)
+- Currency settings synchronization (base currency, local currencies)
+- Web presence configuration sync (domains, subdomains)
+- Latest GraphQL Admin API 2025-07 for market operations
+- `read_markets` and `write_markets` scopes
+
+### Changed
+
+- Enhanced sync interface with market sync option
+- Updated documentation with market sync limitations
+- Added market sync to main sync interface
+
+### Known Issues
+
+- Market web presence configurations may require manual verification after sync
+- Market conditions may need adjustment for staging environment
+
 ## [1.4.0] - 2025-07-25
 
 ### Added
