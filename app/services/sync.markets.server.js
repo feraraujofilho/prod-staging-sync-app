@@ -3,6 +3,8 @@
  * Syncs markets from production to staging using GraphQL Admin API
  */
 
+import { syncMetafieldValues, syncMetafieldDefinitions } from './sync.metafields.server.js';
+
 /**
  * Get all markets from production store
  * @param {string} productionStore - The production store domain
@@ -58,15 +60,25 @@ async function getProductionMarkets(productionStore, accessToken) {
                 id
                 subfolderSuffix
                 defaultLocale {
-                  isoCode
+                  locale
                 }
                 alternateLocales {
-                  isoCode
+                  locale
                 }
                 domain {
                   id
                   host
                 }
+              }
+            }
+            metafields(first: 50) {
+              nodes {
+                id
+                namespace
+                key
+                value
+                type
+                description
               }
             }
           }
@@ -324,20 +336,46 @@ async function createMarketInStaging(market, stagingAdmin) {
 }
 
 /**
+ * Determine if a market supports currency settings based on its conditions
+ * @param {Object} marketConditions - The market conditions object
+ * @returns {boolean} True if market supports currency settings
+ */
+function marketSupportsCurrencySettings(marketConditions) {
+  if (!marketConditions) return false;
+  
+  // Region markets and B2B markets support currency settings
+  // Retail/location markets inherit currency from regions
+  return (
+    marketConditions.regionsCondition?.regions?.nodes?.length > 0 ||
+    marketConditions.companyLocationsCondition?.companyLocations?.nodes?.length > 0
+  );
+}
+
+/**
  * Sync currency settings for a market
  * @param {string} marketId - The market ID in staging
  * @param {Object} currencySettings - The currency settings from production
+ * @param {Object} marketConditions - The market conditions to determine if currency sync is supported
  * @param {Object} stagingAdmin - Shopify admin API client for staging
  * @returns {Promise<Object>} Result object with success status
  */
-async function syncMarketCurrencySettings(marketId, currencySettings, stagingAdmin) {
+async function syncMarketCurrencySettings(marketId, currencySettings, marketConditions, stagingAdmin) {
   if (!currencySettings) {
     return { success: true, message: "No currency settings to sync" };
   }
 
+  // Check if this market type supports currency settings
+  if (!marketSupportsCurrencySettings(marketConditions)) {
+    return {
+      success: true,
+      skipped: true,
+      message: "Currency settings skipped - this market type inherits currency from regions"
+    };
+  }
+
   const mutation = `
-    mutation marketCurrencySettingsUpdate($marketId: ID!, $input: MarketCurrencySettingsUpdateInput!) {
-      marketCurrencySettingsUpdate(marketId: $marketId, input: $input) {
+    mutation marketUpdate($id: ID!, $input: MarketUpdateInput!) {
+      marketUpdate(id: $id, input: $input) {
         market {
           id
           handle
@@ -358,17 +396,27 @@ async function syncMarketCurrencySettings(marketId, currencySettings, stagingAdm
   `;
 
   try {
+    // Build currency settings input for marketUpdate
+    const currencySettingsInput = {};
+    
+    if (currencySettings.baseCurrency?.currencyCode) {
+      currencySettingsInput.baseCurrency = currencySettings.baseCurrency.currencyCode;
+    }
+    
+    if (typeof currencySettings.localCurrencies === 'boolean') {
+      currencySettingsInput.localCurrencies = currencySettings.localCurrencies;
+    }
+
+    // Only proceed if we have currency settings to update
+    if (Object.keys(currencySettingsInput).length === 0) {
+      return { success: true, message: "No currency settings to update" };
+    }
+
     const input = {
-      baseCurrency: currencySettings.baseCurrency?.currencyCode,
-      localCurrencies: currencySettings.localCurrencies
+      currencySettings: currencySettingsInput
     };
 
-    // Only include fields that have values
-    const cleanInput = {};
-    if (input.baseCurrency) cleanInput.baseCurrency = input.baseCurrency;
-    if (typeof input.localCurrencies === 'boolean') cleanInput.localCurrencies = input.localCurrencies;
-
-    const variables = { marketId, input: cleanInput };
+    const variables = { id: marketId, input };
     const response = await stagingAdmin.graphql(mutation, { variables });
     const result = await response.json();
 
@@ -379,25 +427,307 @@ async function syncMarketCurrencySettings(marketId, currencySettings, stagingAdm
       throw new Error(`GraphQL errors: ${errors}`);
     }
 
-    if (result.data?.marketCurrencySettingsUpdate?.userErrors?.length > 0) {
-      const errors = result.data.marketCurrencySettingsUpdate.userErrors
+    if (result.data?.marketUpdate?.userErrors?.length > 0) {
+      const errors = result.data.marketUpdate.userErrors
         .map((e) => e.message)
         .join(", ");
+      
+      // Handle known unified markets restriction
+      if (errors.includes("unified markets is enabled") || errors.includes("action is restricted")) {
+        return {
+          success: true,
+          skipped: true,
+          message: "Currency settings skipped - unified markets enabled (currency managed centrally)"
+        };
+      }
+      
       throw new Error(`Failed to update currency settings: ${errors}`);
     }
 
     return {
       success: true,
-      market: result.data?.marketCurrencySettingsUpdate?.market
+      market: result.data?.marketUpdate?.market
     };
   } catch (error) {
     console.error(`Error syncing currency settings for market ${marketId}:`, error);
+    
+    // Handle unified markets restriction gracefully
+    if (error.message?.includes("unified markets is enabled") || error.message?.includes("action is restricted")) {
+      return {
+        success: true,
+        skipped: true,
+        message: "Currency settings skipped - unified markets enabled (currency managed centrally)"
+      };
+    }
+    
     return {
       success: false,
       error: error.message || "Unknown error occurred"
     };
   }
 }
+
+/**
+ * Enable and publish a locale in the staging store
+ * @param {string} locale - The locale code (e.g., 'pt-BR', 'fr', 'de')
+ * @param {Object} stagingAdmin - Shopify admin API client for staging
+ * @returns {Promise<Object>} Result object with success status
+ */
+async function enableAndPublishLocale(locale, stagingAdmin) {
+  try {
+    // First, enable the locale
+    const enableMutation = `
+      mutation shopLocaleEnable($locale: String!) {
+        shopLocaleEnable(locale: $locale) {
+          shopLocale {
+            locale
+            name
+            published
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const enableResponse = await stagingAdmin.graphql(enableMutation, {
+      variables: { locale }
+    });
+    const enableResult = await enableResponse.json();
+
+    if (enableResult.data?.shopLocaleEnable?.userErrors?.length > 0) {
+      const errors = enableResult.data.shopLocaleEnable.userErrors
+        .map(e => e.message).join(", ");
+      
+      // If locale is already enabled, that's fine
+      if (!errors.includes("already enabled") && !errors.includes("already exists")) {
+        return { success: false, error: `Failed to enable locale ${locale}: ${errors}` };
+      }
+    }
+
+    // Then, publish the locale
+    const publishMutation = `
+      mutation shopLocaleUpdate($locale: String!, $shopLocale: ShopLocaleInput!) {
+        shopLocaleUpdate(locale: $locale, shopLocale: $shopLocale) {
+          shopLocale {
+            name
+            locale
+            primary
+            published
+          }
+          userErrors {
+            field  
+            message
+          }
+        }
+      }
+    `;
+
+    const publishResponse = await stagingAdmin.graphql(publishMutation, {
+      variables: { 
+        locale,
+        shopLocale: { published: true }
+      }
+    });
+    const publishResult = await publishResponse.json();
+
+    if (publishResult.data?.shopLocaleUpdate?.userErrors?.length > 0) {
+      const errors = publishResult.data.shopLocaleUpdate.userErrors
+        .map(e => e.message).join(", ");
+      return { success: false, error: `Failed to publish locale ${locale}: ${errors}` };
+    }
+
+    return { success: true, locale };
+  } catch (error) {
+    console.error(`Error enabling/publishing locale ${locale}:`, error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Sync web presences for a market
+ * @param {string} marketId - The market ID in staging
+ * @param {Array} webPresences - The web presences from production
+ * @param {Object} stagingAdmin - Shopify admin API client for staging
+ * @returns {Promise<Object>} Result object with success status
+ */
+async function syncMarketWebPresences(marketId, webPresences, stagingAdmin) {
+  if (!webPresences || webPresences.length === 0) {
+    return { success: true, message: "No web presences to sync" };
+  }
+
+  const results = {
+    success: true,
+    created: 0,
+    updated: 0,
+    failed: 0,
+    errors: []
+  };
+
+  // First, get existing web presences for this market
+  const getExistingQuery = `
+    query getMarketWebPresences($marketId: ID!) {
+      market(id: $marketId) {
+        webPresences(first: 10) {
+          nodes {
+            id
+            subfolderSuffix
+            defaultLocale {
+              locale
+            }
+            domain {
+              id
+              host
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const existingResponse = await stagingAdmin.graphql(getExistingQuery, { 
+      variables: { marketId } 
+    });
+    const existingResult = await existingResponse.json();
+    const existingWebPresences = existingResult.data?.market?.webPresences?.nodes || [];
+
+    // Step 1: Collect all required locales from all web presences
+    const allRequiredLocales = new Set();
+    webPresences.forEach(webPresence => {
+      if (webPresence.defaultLocale?.locale) {
+        allRequiredLocales.add(webPresence.defaultLocale.locale);
+      }
+      if (webPresence.alternateLocales) {
+        webPresence.alternateLocales.forEach(locale => {
+          if (locale.locale) {
+            allRequiredLocales.add(locale.locale);
+          }
+        });
+      }
+    });
+
+    // Step 2: Enable and publish all required locales
+    const localeResults = [];
+    for (const locale of allRequiredLocales) {
+      const localeResult = await enableAndPublishLocale(locale, stagingAdmin);
+      localeResults.push({ locale, ...localeResult });
+      
+      if (localeResult.success) {
+        console.log(`✅ Successfully enabled and published locale: ${locale}`);
+      } else {
+        console.log(`⚠️ Failed to enable/publish locale ${locale}: ${localeResult.error}`);
+      }
+    }
+
+    // Step 3: Process each web presence from production
+    for (const webPresence of webPresences) {
+      try {
+        // Check if web presence already exists (match by subfolderSuffix and domain)
+        const existingWebPresence = existingWebPresences.find(existing => 
+          existing.subfolderSuffix === webPresence.subfolderSuffix &&
+          existing.domain?.host === webPresence.domain?.host
+        );
+
+        const webPresenceInput = {
+          defaultLocale: webPresence.defaultLocale?.locale,
+          alternateLocales: webPresence.alternateLocales?.map(locale => locale.locale) || [],
+          subfolderSuffix: webPresence.subfolderSuffix
+        };
+
+        // Note: We skip domainId since staging domains will be different
+        // The web presence will use the default domain of the staging store
+
+        if (existingWebPresence) {
+          // Update existing web presence
+          const updateMutation = `
+            mutation marketWebPresenceUpdate($webPresenceId: ID!, $webPresence: MarketWebPresenceUpdateInput!) {
+              marketWebPresenceUpdate(webPresenceId: $webPresenceId, webPresence: $webPresence) {
+                market {
+                  id
+                }
+                userErrors {
+                  field
+                  message
+                  code
+                }
+              }
+            }
+          `;
+
+          const updateResponse = await stagingAdmin.graphql(updateMutation, {
+            variables: {
+              webPresenceId: existingWebPresence.id,
+              webPresence: webPresenceInput
+            }
+          });
+          const updateResult = await updateResponse.json();
+
+          if (updateResult.data?.marketWebPresenceUpdate?.userErrors?.length > 0) {
+            const errors = updateResult.data.marketWebPresenceUpdate.userErrors
+              .map(e => e.message).join(", ");
+            results.errors.push(`Failed to update web presence: ${errors}`);
+            results.failed++;
+          } else {
+            results.updated++;
+          }
+        } else {
+          // Create new web presence
+          const createMutation = `
+            mutation marketWebPresenceCreate($marketId: ID!, $webPresence: MarketWebPresenceCreateInput!) {
+              marketWebPresenceCreate(marketId: $marketId, webPresence: $webPresence) {
+                market {
+                  id
+                }
+                userErrors {
+                  field
+                  message
+                  code
+                }
+              }
+            }
+          `;
+
+          const createResponse = await stagingAdmin.graphql(createMutation, {
+            variables: {
+              marketId,
+              webPresence: webPresenceInput
+            }
+          });
+          const createResult = await createResponse.json();
+
+          if (createResult.data?.marketWebPresenceCreate?.userErrors?.length > 0) {
+            const errors = createResult.data.marketWebPresenceCreate.userErrors
+              .map(e => e.message).join(", ");
+            results.errors.push(`Failed to create web presence: ${errors}`);
+            results.failed++;
+          } else {
+            results.created++;
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing web presence:`, error);
+        results.errors.push(`Web presence processing error: ${error.message}`);
+        results.failed++;
+      }
+    }
+
+    if (results.failed > 0) {
+      results.success = false;
+    }
+
+    return results;
+  } catch (error) {
+    console.error(`Error syncing web presences for market ${marketId}:`, error);
+    return {
+      success: false,
+      error: error.message || "Unknown error occurred"
+    };
+  }
+}
+
 
 /**
  * Update an existing market in staging
@@ -448,33 +778,9 @@ async function updateMarketInStaging(marketId, market, stagingAdmin) {
       };
     }
 
-    // Add company locations if they exist
-    if (
-      market.conditions?.companyLocationsCondition?.companyLocations?.nodes
-        ?.length > 0
-    ) {
-      if (!input.conditions) input.conditions = {};
-      if (!input.conditions.conditionsToAdd)
-        input.conditions.conditionsToAdd = {};
-      input.conditions.conditionsToAdd.companyLocationsCondition = {
-        companyLocationIds:
-          market.conditions.companyLocationsCondition.companyLocations.nodes.map(
-            (location) => location.id,
-          ),
-      };
-    }
-
-    // Add locations if they exist
-    if (market.conditions?.locationsCondition?.locations?.nodes?.length > 0) {
-      if (!input.conditions) input.conditions = {};
-      if (!input.conditions.conditionsToAdd)
-        input.conditions.conditionsToAdd = {};
-      input.conditions.conditionsToAdd.locationsCondition = {
-        locationIds: market.conditions.locationsCondition.locations.nodes.map(
-          (location) => location.id,
-        ),
-      };
-    }
+    // Skip company locations and regular locations for market updates
+    // These IDs are environment-specific and won't exist in staging
+    // Only regions (countries) can be safely synced between environments
 
     const variables = {
       id: marketId,
@@ -548,10 +854,23 @@ export async function syncMarkets(
   };
 
   try {
+    // Add initial summary log
+    log.push({
+      timestamp: new Date().toISOString(),
+      message: "🚀 Starting markets sync operation",
+      type: 'sync_start',
+      details: {
+        productionStore,
+        timestamp: new Date().toISOString(),
+        operation: 'markets_sync'
+      }
+    });
+
     // Step 1: Fetch all markets from production
     log.push({
       timestamp: new Date().toISOString(),
-      message: "Fetching markets from production store...",
+      message: "📥 Fetching markets from production store...",
+      type: 'data_fetch'
     });
 
     onProgress({
@@ -578,16 +897,69 @@ export async function syncMarkets(
       return { summary, log };
     }
 
-    // Step 2: Process each market
+    // Step 2: Sync metafield definitions for MARKET owner type
+    log.push({
+      timestamp: new Date().toISOString(),
+      message: "🔧 Syncing market metafield definitions before processing markets...",
+      type: 'metafield_definitions_sync'
+    });
+
+    onProgress({
+      stage: "metafield_definitions",
+      message: "Syncing market metafield definitions...",
+      percentage: 5,
+    });
+
+    try {
+      const metafieldDefinitionsResult = await syncMetafieldDefinitions(
+        productionStore,
+        accessToken,
+        stagingAdmin,
+        'MARKET' // Only sync MARKET metafield definitions
+      );
+
+      if (metafieldDefinitionsResult.success) {
+        log.push({
+          timestamp: new Date().toISOString(),
+          message: `✅ Successfully synced market metafield definitions`,
+          type: 'metafield_definitions_sync',
+          success: true,
+          details: {
+            created: metafieldDefinitionsResult.summary?.created || 0,
+            existing: metafieldDefinitionsResult.summary?.existing || 0,
+            skipped: metafieldDefinitionsResult.summary?.skipped || 0,
+            failed: metafieldDefinitionsResult.summary?.failed || 0
+          }
+        });
+      } else {
+        log.push({
+          timestamp: new Date().toISOString(),
+          message: `⚠️ Metafield definitions sync had issues: ${metafieldDefinitionsResult.error || 'Unknown error'}`,
+          type: 'metafield_definitions_sync',
+          success: false,
+          error: metafieldDefinitionsResult.error
+        });
+      }
+    } catch (error) {
+      log.push({
+        timestamp: new Date().toISOString(),
+        message: `❌ Failed to sync metafield definitions: ${error.message}`,
+        type: 'metafield_definitions_sync',
+        success: false,
+        error: error.message
+      });
+    }
+
+    // Step 3: Process each market
     onProgress({
       stage: "processing",
       message: "Processing markets...",
-      percentage: 10,
+      percentage: 15,
     });
 
     for (let i = 0; i < productionMarkets.length; i++) {
       const market = productionMarkets[i];
-      const progress = 10 + Math.round((i / productionMarkets.length) * 80);
+      const progress = 15 + Math.round((i / productionMarkets.length) * 75);
 
       onProgress({
         stage: "processing",
@@ -597,7 +969,18 @@ export async function syncMarkets(
 
       log.push({
         timestamp: new Date().toISOString(),
-        message: `Processing market: ${market.name} (handle: ${market.handle})`,
+        message: `📋 Processing market: ${market.name} (handle: ${market.handle})`,
+        details: {
+          marketId: market.id,
+          status: market.status,
+          regions: market.conditions?.regionsCondition?.regions?.nodes?.length || 0,
+          webPresences: market.webPresences?.nodes?.length || 0,
+          metafields: market.metafields?.nodes?.length || 0,
+          currencySettings: market.currencySettings ? {
+            baseCurrency: market.currencySettings.baseCurrency?.currencyCode,
+            localCurrencies: market.currencySettings.localCurrencies
+          } : null
+        }
       });
 
       // Check if market already exists in staging
@@ -626,6 +1009,167 @@ export async function syncMarkets(
             message: `✅ Successfully updated market: ${market.name}`,
             success: true,
           });
+
+          // Sync currency settings after successful market update
+          if (market.currencySettings) {
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `💱 Syncing currency settings for market: ${market.name}`,
+              details: {
+                baseCurrency: market.currencySettings.baseCurrency?.currencyCode,
+                localCurrencies: market.currencySettings.localCurrencies,
+                marketSupportsSettings: marketSupportsCurrencySettings(market.conditions)
+              }
+            });
+
+            const currencyResult = await syncMarketCurrencySettings(
+              existingMarket.id,
+              market.currencySettings,
+              market.conditions,
+              stagingAdmin
+            );
+
+            if (currencyResult.success) {
+              if (currencyResult.skipped) {
+                log.push({
+                  timestamp: new Date().toISOString(),
+                  message: `⚠️ Currency settings skipped for market "${market.name}": ${currencyResult.message}`,
+                  type: 'currency_sync',
+                  skipped: true,
+                  details: { reason: currencyResult.message }
+                });
+              } else {
+                log.push({
+                  timestamp: new Date().toISOString(),
+                  message: `✅ Successfully synced currency settings for market: ${market.name}`,
+                  type: 'currency_sync',
+                  success: true,
+                  details: {
+                    baseCurrency: market.currencySettings.baseCurrency?.currencyCode,
+                    localCurrencies: market.currencySettings.localCurrencies
+                  }
+                });
+              }
+            } else {
+              summary.errors.push(`Currency sync failed for "${market.name}": ${currencyResult.error}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Currency sync failed for market "${market.name}": ${currencyResult.error}`,
+                type: 'currency_sync',
+                success: false,
+                error: currencyResult.error,
+              });
+            }
+          }
+
+          // Sync web presences after successful market update
+          if (market.webPresences?.nodes?.length > 0) {
+            const webPresenceDetails = market.webPresences.nodes.map(wp => ({
+              subfolderSuffix: wp.subfolderSuffix,
+              defaultLocale: wp.defaultLocale?.locale,
+              alternateLocales: wp.alternateLocales?.map(l => l.locale) || [],
+              domain: wp.domain?.host
+            }));
+
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `🌐 Syncing web presences and locales for market: ${market.name}`,
+              type: 'web_presence_sync',
+              details: {
+                count: market.webPresences.nodes.length,
+                webPresences: webPresenceDetails
+              }
+            });
+
+            const webPresenceResult = await syncMarketWebPresences(
+              existingMarket.id,
+              market.webPresences.nodes,
+              stagingAdmin
+            );
+
+            if (webPresenceResult.success) {
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `✅ Successfully synced ${webPresenceResult.created + webPresenceResult.updated} web presences for market: ${market.name}`,
+                type: 'web_presence_sync',
+                success: true,
+                details: {
+                  created: webPresenceResult.created,
+                  updated: webPresenceResult.updated,
+                  failed: webPresenceResult.failed,
+                  total: webPresenceResult.created + webPresenceResult.updated
+                }
+              });
+            } else {
+              summary.errors.push(`Web presence sync failed for "${market.name}": ${webPresenceResult.error || webPresenceResult.errors?.join(", ")}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Web presence sync failed for market "${market.name}"`,
+                type: 'web_presence_sync',
+                success: false,
+                error: webPresenceResult.error || webPresenceResult.errors?.join(", "),
+                details: {
+                  errors: webPresenceResult.errors || []
+                }
+              });
+            }
+          }
+
+          // Sync metafields after successful market update
+          if (market.metafields?.nodes?.length > 0) {
+            const metafieldDetails = market.metafields.nodes.map(mf => ({
+              namespace: mf.namespace,
+              key: mf.key,
+              type: mf.type,
+              valuePreview: mf.value?.length > 50 ? mf.value.substring(0, 50) + '...' : mf.value
+            }));
+
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `🏷️ Syncing metafields for market: ${market.name}`,
+              type: 'metafields_sync',
+              details: {
+                count: market.metafields.nodes.length,
+                metafields: metafieldDetails
+              }
+            });
+
+            const metafieldsResult = await syncMetafieldValues(
+              existingMarket.id,
+              'MARKET',
+              market.metafields.nodes,
+              stagingAdmin
+            );
+
+            if (metafieldsResult.success) {
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `✅ Successfully synced ${metafieldsResult.created + metafieldsResult.updated} metafields for market: ${market.name}`,
+                type: 'metafields_sync',
+                success: true,
+                details: {
+                  created: metafieldsResult.created,
+                  updated: metafieldsResult.updated,
+                  skipped: metafieldsResult.skipped,
+                  failed: metafieldsResult.failed,
+                  total: metafieldsResult.created + metafieldsResult.updated,
+                  errors: metafieldsResult.errors || []
+                }
+              });
+            } else {
+              summary.errors.push(`Metafields sync failed for "${market.name}": ${metafieldsResult.error || metafieldsResult.errors?.join(", ")}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Metafields sync failed for market "${market.name}"`,
+                type: 'metafields_sync',
+                success: false,
+                error: metafieldsResult.error || metafieldsResult.errors?.join(", "),
+                details: {
+                  errors: metafieldsResult.errors || []
+                }
+              });
+            }
+          }
         } else {
           summary.failed++;
           const errorMessage = `Failed to update market "${market.name}" (handle: ${market.handle}): ${result.error}`;
@@ -653,6 +1197,168 @@ export async function syncMarkets(
             message: `✅ Successfully created market: ${market.name}`,
             success: true,
           });
+
+          // Sync currency settings after successful market creation
+          if (market.currencySettings && result.market?.id) {
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `💱 Syncing currency settings for new market: ${market.name}`,
+              type: 'currency_sync',
+              details: {
+                baseCurrency: market.currencySettings.baseCurrency?.currencyCode,
+                localCurrencies: market.currencySettings.localCurrencies,
+                marketSupportsSettings: marketSupportsCurrencySettings(market.conditions)
+              }
+            });
+
+            const currencyResult = await syncMarketCurrencySettings(
+              result.market.id,
+              market.currencySettings,
+              market.conditions,
+              stagingAdmin
+            );
+
+            if (currencyResult.success) {
+              if (currencyResult.skipped) {
+                log.push({
+                  timestamp: new Date().toISOString(),
+                  message: `⚠️ Currency settings skipped for new market "${market.name}": ${currencyResult.message}`,
+                  type: 'currency_sync',
+                  skipped: true,
+                  details: { reason: currencyResult.message }
+                });
+              } else {
+                log.push({
+                  timestamp: new Date().toISOString(),
+                  message: `✅ Successfully synced currency settings for new market: ${market.name}`,
+                  type: 'currency_sync',
+                  success: true,
+                  details: {
+                    baseCurrency: market.currencySettings.baseCurrency?.currencyCode,
+                    localCurrencies: market.currencySettings.localCurrencies
+                  }
+                });
+              }
+            } else {
+              summary.errors.push(`Currency sync failed for new "${market.name}": ${currencyResult.error}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Currency sync failed for new market "${market.name}": ${currencyResult.error}`,
+                type: 'currency_sync',
+                success: false,
+                error: currencyResult.error,
+              });
+            }
+          }
+
+          // Sync web presences after successful market creation
+          if (market.webPresences?.nodes?.length > 0 && result.market?.id) {
+            const webPresenceDetails = market.webPresences.nodes.map(wp => ({
+              subfolderSuffix: wp.subfolderSuffix,
+              defaultLocale: wp.defaultLocale?.locale,
+              alternateLocales: wp.alternateLocales?.map(l => l.locale) || [],
+              domain: wp.domain?.host
+            }));
+
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `🌐 Syncing web presences and locales for new market: ${market.name}`,
+              type: 'web_presence_sync',
+              details: {
+                count: market.webPresences.nodes.length,
+                webPresences: webPresenceDetails
+              }
+            });
+
+            const webPresenceResult = await syncMarketWebPresences(
+              result.market.id,
+              market.webPresences.nodes,
+              stagingAdmin
+            );
+
+            if (webPresenceResult.success) {
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `✅ Successfully synced ${webPresenceResult.created + webPresenceResult.updated} web presences for new market: ${market.name}`,
+                type: 'web_presence_sync',
+                success: true,
+                details: {
+                  created: webPresenceResult.created,
+                  updated: webPresenceResult.updated,
+                  failed: webPresenceResult.failed,
+                  total: webPresenceResult.created + webPresenceResult.updated
+                }
+              });
+            } else {
+              summary.errors.push(`Web presence sync failed for new "${market.name}": ${webPresenceResult.error || webPresenceResult.errors?.join(", ")}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Web presence sync failed for new market "${market.name}"`,
+                type: 'web_presence_sync',
+                success: false,
+                error: webPresenceResult.error || webPresenceResult.errors?.join(", "),
+                details: {
+                  errors: webPresenceResult.errors || []
+                }
+              });
+            }
+          }
+
+          // Sync metafields after successful market creation
+          if (market.metafields?.nodes?.length > 0 && result.market?.id) {
+            const metafieldDetails = market.metafields.nodes.map(mf => ({
+              namespace: mf.namespace,
+              key: mf.key,
+              type: mf.type,
+              valuePreview: mf.value?.length > 50 ? mf.value.substring(0, 50) + '...' : mf.value
+            }));
+
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `🏷️ Syncing metafields for new market: ${market.name}`,
+              type: 'metafields_sync',
+              details: {
+                count: market.metafields.nodes.length,
+                metafields: metafieldDetails
+              }
+            });
+
+            const metafieldsResult = await syncMetafieldValues(
+              result.market.id,
+              'MARKET',
+              market.metafields.nodes,
+              stagingAdmin
+            );
+
+            if (metafieldsResult.success) {
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `✅ Successfully synced ${metafieldsResult.created + metafieldsResult.updated} metafields for new market: ${market.name}`,
+                type: 'metafields_sync',
+                success: true,
+                details: {
+                  created: metafieldsResult.created,
+                  updated: metafieldsResult.updated,
+                  skipped: metafieldsResult.skipped,
+                  failed: metafieldsResult.failed,
+                  total: metafieldsResult.created + metafieldsResult.updated,
+                  errors: metafieldsResult.errors || []
+                }
+              });
+            } else {
+              summary.errors.push(`Metafields sync failed for new "${market.name}": ${metafieldsResult.error || metafieldsResult.errors?.join(", ")}`);
+              log.push({
+                timestamp: new Date().toISOString(),
+                message: `❌ Metafields sync failed for new market "${market.name}"`,
+                type: 'metafields_sync',
+                success: false,
+                error: metafieldsResult.error || metafieldsResult.errors?.join(", "),
+                details: {
+                  errors: metafieldsResult.errors || []
+                }
+              });
+            }
+          }
         } else {
           summary.failed++;
           const errorMessage = `Failed to create market "${market.name}" (handle: ${market.handle}): ${result.error}`;
@@ -667,16 +1373,85 @@ export async function syncMarkets(
       }
     }
 
-    // Step 3: Finalize
+    // Step 4: Finalize
     onProgress({
       stage: "completed",
       message: "Market sync completed",
       percentage: 100,
     });
 
+    // Calculate detailed statistics from logs
+    const metafieldDefinitionsLogs = log.filter(l => l.type === 'metafield_definitions_sync');
+    const currencyLogs = log.filter(l => l.type === 'currency_sync');
+    const webPresenceLogs = log.filter(l => l.type === 'web_presence_sync');
+    const metafieldLogs = log.filter(l => l.type === 'metafields_sync');
+    
+    const currencyStats = {
+      successful: currencyLogs.filter(l => l.success === true).length,
+      skipped: currencyLogs.filter(l => l.skipped === true).length,
+      failed: currencyLogs.filter(l => l.success === false).length
+    };
+    
+    const webPresenceStats = {
+      successful: webPresenceLogs.filter(l => l.success === true).length,
+      failed: webPresenceLogs.filter(l => l.success === false).length,
+      totalCreated: webPresenceLogs.reduce((sum, l) => sum + (l.details?.created || 0), 0),
+      totalUpdated: webPresenceLogs.reduce((sum, l) => sum + (l.details?.updated || 0), 0)
+    };
+    
+    const metafieldStats = {
+      successful: metafieldLogs.filter(l => l.success === true).length,
+      failed: metafieldLogs.filter(l => l.success === false).length,
+      totalCreated: metafieldLogs.reduce((sum, l) => sum + (l.details?.created || 0), 0),
+      totalUpdated: metafieldLogs.reduce((sum, l) => sum + (l.details?.updated || 0), 0),
+      totalSkipped: metafieldLogs.reduce((sum, l) => sum + (l.details?.skipped || 0), 0)
+    };
+
     log.push({
       timestamp: new Date().toISOString(),
-      message: `Market sync completed. Created: ${summary.created}, Updated: ${summary.updated}, Failed: ${summary.failed}`,
+      message: `🎉 Market sync completed successfully!`,
+      type: 'sync_summary',
+      success: true,
+      details: {
+        metafieldDefinitionsSync: {
+          processed: metafieldDefinitionsLogs.length > 0,
+          successful: metafieldDefinitionsLogs.filter(l => l.success === true).length > 0,
+          created: metafieldDefinitionsLogs.reduce((sum, l) => sum + (l.details?.created || 0), 0),
+          existing: metafieldDefinitionsLogs.reduce((sum, l) => sum + (l.details?.existing || 0), 0),
+          skipped: metafieldDefinitionsLogs.reduce((sum, l) => sum + (l.details?.skipped || 0), 0),
+          failed: metafieldDefinitionsLogs.reduce((sum, l) => sum + (l.details?.failed || 0), 0)
+        },
+        markets: {
+          total: summary.total,
+          created: summary.created,
+          updated: summary.updated,
+          failed: summary.failed,
+          skipped: summary.skipped
+        },
+        currencySync: {
+          processed: currencyStats.successful + currencyStats.failed,
+          successful: currencyStats.successful,
+          skipped: currencyStats.skipped,
+          failed: currencyStats.failed
+        },
+        webPresenceSync: {
+          marketsProcessed: webPresenceStats.successful + webPresenceStats.failed,
+          successful: webPresenceStats.successful,
+          failed: webPresenceStats.failed,
+          webPresencesCreated: webPresenceStats.totalCreated,
+          webPresencesUpdated: webPresenceStats.totalUpdated
+        },
+        metafieldsSync: {
+          marketsProcessed: metafieldStats.successful + metafieldStats.failed,
+          successful: metafieldStats.successful,
+          failed: metafieldStats.failed,
+          metafieldsCreated: metafieldStats.totalCreated,
+          metafieldsUpdated: metafieldStats.totalUpdated,
+          metafieldsSkipped: metafieldStats.totalSkipped
+        },
+        totalErrors: summary.errors.length,
+        duration: `${((Date.now() - (Date.parse(log[0]?.timestamp) || Date.now())) / 1000).toFixed(1)}s`
+      }
     });
 
     return { summary, log };

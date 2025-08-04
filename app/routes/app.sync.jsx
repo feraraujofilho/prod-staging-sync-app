@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect } from "react";
 import {
   useLoaderData,
   useActionData,
-  Form,
   useNavigation,
   useSubmit,
 } from "@remix-run/react";
@@ -19,13 +18,10 @@ import {
   EmptyState,
   Tabs,
   Select,
-  ProgressBar,
   DataTable,
   Scrollable,
   Icon,
   Box,
-  Divider,
-  List,
   Modal,
 } from "@shopify/polaris";
 import {
@@ -33,7 +29,6 @@ import {
   ProductIcon,
   CollectionIcon,
   ProfileIcon,
-  OrderIcon,
   SettingsIcon,
   ImportIcon,
   ImageIcon,
@@ -46,6 +41,9 @@ import { syncImageFiles } from "../services/sync.files.server";
 import { syncNavigationMenus } from "../services/sync.navigation.server";
 import { syncPages } from "../services/sync.pages.server";
 import { syncMarkets } from "../services/sync.markets.server";
+import { syncProducts } from "../services/sync.products.server";
+import { syncCollections } from "../services/sync.collections.server";
+import { syncLocations } from "../services/sync.locations.server";
 
 // Loader to fetch connections and recent sync logs
 export const loader = async ({ request }) => {
@@ -78,12 +76,24 @@ export const loader = async ({ request }) => {
     },
   });
 
-  return { connections, recentLogs };
+  // Get the most recently used connection ID for preselection
+  const lastUsedConnection = await prisma.syncLog.findFirst({
+    where: { shop: session.shop },
+    orderBy: { startedAt: "desc" },
+    select: {
+      connectionId: true,
+    },
+  });
+
+  return {
+    connections,
+    recentLogs,
+    lastUsedConnectionId: lastUsedConnection?.connectionId || "",
+  };
 };
 
 // Action handler for sync operations
 export const action = async ({ request }) => {
-  const { decrypt } = await import("../utils/encryption.server");
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
 
@@ -133,6 +143,7 @@ export const action = async ({ request }) => {
           connection.storeDomain,
           decryptedToken,
           admin,
+          ["PRODUCT", "PRODUCTVARIANT"], // Sync both product and variant metafield definitions
         );
         break;
 
@@ -145,19 +156,19 @@ export const action = async ({ request }) => {
         break;
 
       case "products":
-        // TODO: Implement product sync
-        result = {
-          success: false,
-          error: "Product sync not yet implemented",
-        };
+        result = await syncProducts(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+        );
         break;
 
       case "collections":
-        // TODO: Implement collection sync
-        result = {
-          success: false,
-          error: "Collection sync not yet implemented",
-        };
+        result = await syncCollections(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+        );
         break;
 
       case "files":
@@ -188,6 +199,18 @@ export const action = async ({ request }) => {
         );
         break;
 
+      case "locations":
+        result = await syncLocations(
+          connection.storeDomain,
+          decryptedToken,
+          admin,
+          (progress) => {
+            // Progress callback for locations sync
+            console.log("Location sync progress:", progress);
+          },
+        );
+        break;
+
       default:
         result = {
           success: false,
@@ -212,13 +235,25 @@ export const action = async ({ request }) => {
       status = "success";
     }
 
+    // Debug: Log what we're about to save
+    const logsToSave = result.logs || result.log || [];
+    console.log("=== SYNC DEBUG ===");
+    console.log("Sync type:", syncType);
+    console.log("Result summary:", JSON.stringify(result.summary, null, 2));
+    console.log("Result logs count:", logsToSave.length);
+    console.log(
+      "First few logs:",
+      JSON.stringify(logsToSave.slice(0, 3), null, 2),
+    );
+    console.log("==================");
+
     // Update sync log with results
     await prisma.syncLog.update({
       where: { id: syncLog.id },
       data: {
         status: status,
         summary: JSON.stringify(result.summary || {}),
-        logs: JSON.stringify(result.logs || []),
+        logs: JSON.stringify(logsToSave),
         completedAt: new Date(),
       },
     });
@@ -250,7 +285,7 @@ const SYNC_TYPES = [
   {
     id: "metafield_definitions",
     label: "Metafield Definitions",
-    description: "Sync product metafield structures between stores",
+    description: "Sync product and variant metafield structures between stores",
     icon: SettingsIcon,
     available: true,
   },
@@ -258,6 +293,13 @@ const SYNC_TYPES = [
     id: "metaobject_definitions",
     label: "Metaobject Definitions",
     description: "Sync metaobject definitions between stores",
+    icon: ImportIcon,
+    available: true,
+  },
+  {
+    id: "locations",
+    label: "Locations",
+    description: "Sync store locations for inventory management",
     icon: ImportIcon,
     available: true,
   },
@@ -295,25 +337,26 @@ const SYNC_TYPES = [
     label: "Products",
     description: "Sync product catalog including variants and images",
     icon: ProductIcon,
-    available: false,
+    available: true,
   },
   {
     id: "collections",
     label: "Collections",
     description: "Sync collections and their product associations",
     icon: CollectionIcon,
-    available: false,
+    available: true,
   },
 ];
 
 export default function DataSync() {
-  const { connections, recentLogs } = useLoaderData();
+  const { connections, recentLogs, lastUsedConnectionId } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const submit = useSubmit();
 
   const [selectedTab, setSelectedTab] = useState(0);
-  const [selectedConnection, setSelectedConnection] = useState("");
+  const [selectedConnection, setSelectedConnection] =
+    useState(lastUsedConnectionId);
   const [showLogs, setShowLogs] = useState(false);
   const [selectedLogId, setSelectedLogId] = useState(null);
   const [selectedLogDetails, setSelectedLogDetails] = useState(null);
@@ -533,100 +576,102 @@ export default function DataSync() {
               >
                 <div style={{ paddingTop: "16px" }}>
                   {selectedTab === 0 && (
-                    <Card>
-                      <BlockStack gap="400">
-                        <Text variant="headingMd" as="h2">
-                          Available Sync Operations
-                        </Text>
+                    <>
+                      <Card>
+                        <BlockStack gap="400">
+                          <Text variant="headingMd" as="h2">
+                            Available Sync Operations
+                          </Text>
 
-                        <BlockStack gap="300">
-                          <Box
-                            padding="300"
-                            borderRadius="200"
-                            background="bg-info-subdued"
-                          >
-                            <InlineStack gap="300" blockAlign="center">
-                              <Icon source={SettingsIcon} color="info" />
-                              <Text variant="bodySm" color="subdued">
-                                Configure navigation menu sync settings in{" "}
-                                <a
-                                  href="/app/navigation-config"
-                                  style={{
-                                    color: "inherit",
-                                    textDecoration: "underline",
-                                  }}
-                                >
-                                  Navigation Settings
-                                </a>
-                              </Text>
-                            </InlineStack>
-                          </Box>
-
-                          {SYNC_TYPES.map((syncType) => (
+                          <BlockStack gap="300">
                             <Box
-                              key={syncType.id}
-                              padding="400"
+                              padding="300"
                               borderRadius="200"
-                              background={
-                                syncType.available
-                                  ? "bg-surface"
-                                  : "bg-surface-disabled"
-                              }
+                              background="bg-info-subdued"
                             >
-                              <InlineStack
-                                gap="400"
-                                align="space-between"
-                                blockAlign="center"
-                              >
-                                <InlineStack gap="400" blockAlign="center">
-                                  <Icon
-                                    source={syncType.icon}
-                                    color={
-                                      syncType.available ? "base" : "subdued"
-                                    }
-                                  />
-                                  <BlockStack gap="100">
-                                    <Text
-                                      variant="bodyMd"
-                                      fontWeight="semibold"
-                                    >
-                                      {syncType.label}
-                                    </Text>
-                                    <Text variant="bodySm" color="subdued">
-                                      {syncType.description}
-                                    </Text>
-                                  </BlockStack>
-                                </InlineStack>
-
-                                <Button
-                                  primary={syncType.available}
-                                  disabled={
-                                    !syncType.available ||
-                                    !selectedConnection ||
-                                    isLoading
-                                  }
-                                  loading={
-                                    isLoading &&
-                                    navigation.formData?.get("syncType") ===
-                                      syncType.id
-                                  }
-                                  onClick={() => handleSync(syncType.id)}
-                                >
-                                  {syncType.available ? (
-                                    <>
-                                      <Icon source={RefreshIcon} />
-                                      Sync Now
-                                    </>
-                                  ) : (
-                                    "Coming Soon"
-                                  )}
-                                </Button>
+                              <InlineStack gap="300" blockAlign="center">
+                                <Icon source={SettingsIcon} color="info" />
+                                <Text variant="bodySm" color="subdued">
+                                  Configure navigation menu sync settings in{" "}
+                                  <a
+                                    href="/app/navigation-config"
+                                    style={{
+                                      color: "inherit",
+                                      textDecoration: "underline",
+                                    }}
+                                  >
+                                    Navigation Settings
+                                  </a>
+                                </Text>
                               </InlineStack>
                             </Box>
-                          ))}
+
+                            {SYNC_TYPES.map((syncType) => (
+                              <Box
+                                key={syncType.id}
+                                padding="400"
+                                borderRadius="200"
+                                background={
+                                  syncType.available
+                                    ? "bg-surface"
+                                    : "bg-surface-disabled"
+                                }
+                              >
+                                <InlineStack
+                                  gap="400"
+                                  align="space-between"
+                                  blockAlign="center"
+                                >
+                                  <InlineStack gap="400" blockAlign="center">
+                                    <Icon
+                                      source={syncType.icon}
+                                      color={
+                                        syncType.available ? "base" : "subdued"
+                                      }
+                                    />
+                                    <BlockStack gap="100">
+                                      <Text
+                                        variant="bodyMd"
+                                        fontWeight="semibold"
+                                      >
+                                        {syncType.label}
+                                      </Text>
+                                      <Text variant="bodySm" color="subdued">
+                                        {syncType.description}
+                                      </Text>
+                                    </BlockStack>
+                                  </InlineStack>
+
+                                  <Button
+                                    primary={syncType.available}
+                                    disabled={
+                                      !syncType.available ||
+                                      !selectedConnection ||
+                                      isLoading
+                                    }
+                                    loading={
+                                      isLoading &&
+                                      navigation.formData?.get("syncType") ===
+                                        syncType.id
+                                    }
+                                    onClick={() => handleSync(syncType.id)}
+                                  >
+                                    {syncType.available ? (
+                                      <>
+                                        <Icon source={RefreshIcon} />
+                                        Sync Now
+                                      </>
+                                    ) : (
+                                      "Coming Soon"
+                                    )}
+                                  </Button>
+                                </InlineStack>
+                              </Box>
+                            ))}
+                          </BlockStack>
                         </BlockStack>
-                      </BlockStack>
-                    </Card>
+                      </Card>
+                    </>
                   )}
 
                   {selectedTab === 1 && (
@@ -1121,25 +1166,129 @@ export default function DataSync() {
                       </Text>
                       <Scrollable style={{ height: "400px" }}>
                         <BlockStack gap="100">
-                          {selectedLogDetails.parsedLogs.map((log, index) => (
-                            <Box key={index} padding="200">
-                              <Text
-                                variant="bodySm"
-                                color={
-                                  log.error || log.message?.includes("❌")
-                                    ? "critical"
-                                    : log.success || log.message?.includes("✅")
-                                      ? "success"
-                                      : log.skipped ||
-                                          log.message?.includes("⚠️")
-                                        ? "caution"
-                                        : "subdued"
+                          {selectedLogDetails.parsedLogs.map((log, index) => {
+                            const isSuccess =
+                              log.success === true ||
+                              log.message?.includes("✅");
+                            const isError =
+                              log.success === false ||
+                              log.error ||
+                              log.message?.includes("❌");
+                            const isSkipped =
+                              log.skipped === true ||
+                              log.message?.includes("⚠️");
+                            const isInfo =
+                              log.message?.includes("📋") ||
+                              log.message?.includes("🔧") ||
+                              log.message?.includes("🎉");
+
+                            return (
+                              <Box
+                                key={index}
+                                padding="300"
+                                borderColor={
+                                  isSuccess
+                                    ? "success"
+                                    : isError
+                                      ? "critical"
+                                      : isSkipped
+                                        ? "warning"
+                                        : "border-subdued"
+                                }
+                                borderWidth="025"
+                                borderRadius="200"
+                                background={
+                                  isSuccess
+                                    ? "surface-success-subdued"
+                                    : isError
+                                      ? "surface-critical-subdued"
+                                      : isSkipped
+                                        ? "surface-caution-subdued"
+                                        : "surface-subdued"
                                 }
                               >
-                                [{log.timestamp}] {log.message}
-                              </Text>
-                            </Box>
-                          ))}
+                                <BlockStack gap="200">
+                                  <InlineStack gap="200" align="space-between">
+                                    <Text
+                                      variant="bodySm"
+                                      color={
+                                        isSuccess
+                                          ? "success"
+                                          : isError
+                                            ? "critical"
+                                            : isSkipped
+                                              ? "warning"
+                                              : undefined
+                                      }
+                                      fontWeight={
+                                        isInfo ? "semibold" : undefined
+                                      }
+                                    >
+                                      {log.message}
+                                    </Text>
+                                    {log.timestamp && (
+                                      <Text variant="captionMd" color="subdued">
+                                        {new Date(
+                                          log.timestamp,
+                                        ).toLocaleTimeString()}
+                                      </Text>
+                                    )}
+                                  </InlineStack>
+
+                                  {/* Show log type and additional details */}
+                                  {(log.type || log.details || log.error) && (
+                                    <BlockStack gap="100">
+                                      {log.type && (
+                                        <Badge
+                                          status={
+                                            isSuccess
+                                              ? "success"
+                                              : isError
+                                                ? "critical"
+                                                : isSkipped
+                                                  ? "attention"
+                                                  : "info"
+                                          }
+                                        >
+                                          {log.type.replace(/_/g, " ")}
+                                        </Badge>
+                                      )}
+
+                                      {log.error && (
+                                        <Text
+                                          variant="captionMd"
+                                          color="critical"
+                                        >
+                                          ❌ {log.error}
+                                        </Text>
+                                      )}
+
+                                      {log.details &&
+                                        typeof log.details === "object" && (
+                                          <Box
+                                            padding="200"
+                                            background="surface"
+                                            borderRadius="100"
+                                          >
+                                            <Text
+                                              variant="captionMd"
+                                              color="subdued"
+                                              fontFamily="mono"
+                                            >
+                                              {JSON.stringify(
+                                                log.details,
+                                                null,
+                                                2,
+                                              )}
+                                            </Text>
+                                          </Box>
+                                        )}
+                                    </BlockStack>
+                                  )}
+                                </BlockStack>
+                              </Box>
+                            );
+                          })}
                         </BlockStack>
                       </Scrollable>
                     </BlockStack>

@@ -346,42 +346,93 @@ export async function syncMetafieldDefinitions(
   productionStore,
   accessToken,
   stagingAdmin,
+  ownerType = "PRODUCT",
 ) {
+  // Handle array of owner types by calling this function for each type
+  if (Array.isArray(ownerType)) {
+    const results = {
+      success: true,
+      logs: [],
+      results: [],
+      summary: {
+        total: 0,
+        existing: 0,
+        created: 0,
+        skipped: 0,
+        failed: 0,
+        updated: 0,
+        updateFailed: 0,
+      },
+    };
+
+    for (const singleOwnerType of ownerType) {
+      const singleResult = await syncMetafieldDefinitions(
+        productionStore,
+        accessToken,
+        stagingAdmin,
+        singleOwnerType,
+      );
+
+      // Merge results
+      results.logs.push(...singleResult.logs);
+      results.results.push(...(singleResult.results || []));
+
+      // Merge summary
+      if (singleResult.summary) {
+        results.summary.total += singleResult.summary.total || 0;
+        results.summary.existing += singleResult.summary.existing || 0;
+        results.summary.created += singleResult.summary.created || 0;
+        results.summary.skipped += singleResult.summary.skipped || 0;
+        results.summary.failed += singleResult.summary.failed || 0;
+        results.summary.updated += singleResult.summary.updated || 0;
+        results.summary.updateFailed += singleResult.summary.updateFailed || 0;
+      }
+
+      // If any single result failed, mark overall as failed
+      if (!singleResult.success) {
+        results.success = false;
+        results.error = singleResult.error;
+      }
+    }
+
+    return results;
+  }
+
   const log = [];
+  const ownerTypeLabel = ownerType.toLowerCase();
 
   try {
-    // Step 1: Fetch product metafield definitions from production
+    // Step 1: Fetch metafield definitions from production
     log.push({
       timestamp: new Date().toISOString(),
-      message:
-        "Fetching product metafield definitions from production store...",
+      message: `Fetching ${ownerTypeLabel} metafield definitions from production store...`,
     });
 
     const productionDefinitions = await getMetafieldDefinitions(
-      "PRODUCT",
+      ownerType,
       productionStore,
       accessToken,
     );
 
     log.push({
       timestamp: new Date().toISOString(),
-      message: `Found ${productionDefinitions.length} product metafield definitions in production`,
+      message: `Found ${productionDefinitions.length} ${ownerTypeLabel} metafield definitions in production`,
     });
 
     // Step 2: Fetch existing definitions from staging
     log.push({
       timestamp: new Date().toISOString(),
-      message: "Fetching existing definitions from staging store...",
+      message: `Fetching existing ${ownerTypeLabel} definitions from staging store...`,
     });
 
     const stagingDefinitions = await getExistingStagingDefinitions(
-      "PRODUCT",
+      ownerType,
       stagingAdmin,
     );
 
     log.push({
       timestamp: new Date().toISOString(),
-      message: `Found ${stagingDefinitions.length} existing definitions in staging`,
+      message: `Found ${stagingDefinitions.length} existing ${ownerTypeLabel} definitions in staging`,
     });
 
     // Step 3: Compare and find missing definitions (case-insensitive for keys)
@@ -792,6 +843,369 @@ export async function syncMetafieldDefinitions(
       success: false,
       logs: log,
       error: error.message,
+    };
+  }
+}
+
+/**
+ * Check if metafield definitions exist in staging
+ * @param {string} ownerType - The resource type
+ * @param {Array} metafields - The metafields to check
+ * @param {Object} stagingAdmin - Shopify admin API client
+ * @returns {Promise<Object>} Object with allExist flag and missing definitions
+ */
+async function checkMetafieldDefinitions(ownerType, metafields, stagingAdmin) {
+  const query = `
+    query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!) {
+      metafieldDefinitions(ownerType: $ownerType, first: 250) {
+        edges {
+          node {
+            namespace
+            key
+            type {
+              name
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const response = await stagingAdmin.graphql(query, {
+      variables: { ownerType },
+    });
+    const result = await response.json();
+
+    const definitions =
+      result.data?.metafieldDefinitions?.edges?.map((e) => e.node) || [];
+    const definitionMap = new Map();
+
+    definitions.forEach((def) => {
+      definitionMap.set(`${def.namespace}.${def.key}`, def.type.name);
+    });
+
+    const missing = [];
+    metafields.forEach((mf) => {
+      const key = `${mf.namespace}.${mf.key}`;
+      if (!definitionMap.has(key)) {
+        missing.push({
+          namespace: mf.namespace,
+          key: mf.key,
+          type: mf.type,
+        });
+      }
+    });
+
+    return {
+      allExist: missing.length === 0,
+      missing,
+    };
+  } catch (error) {
+    console.error("Error checking metafield definitions:", error);
+    return { allExist: true, missing: [] }; // Assume they exist to avoid blocking
+  }
+}
+
+/**
+ * Sync metafield values for a specific resource
+ * @param {string} ownerId - The resource ID in staging (e.g., market ID, product ID)
+ * @param {string} ownerType - The resource type (e.g., 'MARKET', 'PRODUCT')
+ * @param {Array} metafields - The metafields from production
+ * @param {Object} stagingAdmin - Shopify admin API client for staging
+ * @returns {Promise<Object>} Result object with success status
+ */
+export async function syncMetafieldValues(
+  ownerId,
+  ownerType,
+  metafields,
+  stagingAdmin,
+) {
+  console.log(
+    `🔍 Starting metafields sync for ${ownerType} ${ownerId} with ${metafields?.length || 0} metafields`,
+  );
+
+  if (!metafields || metafields.length === 0) {
+    return { success: true, message: "No metafields to sync" };
+  }
+
+  // First, let's check if metafield definitions exist
+  const definitionsCheck = await checkMetafieldDefinitions(
+    ownerType,
+    metafields,
+    stagingAdmin,
+  );
+  if (!definitionsCheck.allExist) {
+    console.warn(`⚠️ Missing metafield definitions for ${ownerType}:`);
+    definitionsCheck.missing.forEach((m) => {
+      console.warn(`  - ${m.namespace}.${m.key} (type: ${m.type})`);
+    });
+  }
+
+  const results = {
+    success: true,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    failed: 0,
+    errors: [],
+    missingDefinitions: definitionsCheck.missing,
+  };
+
+  // Build the appropriate query based on owner type
+  const ownerTypeQueries = {
+    MARKET: `
+      query getMetafields($ownerId: ID!) {
+        market(id: $ownerId) {
+          metafields(first: 50) {
+            nodes {
+              id
+              namespace
+              key
+              value
+              type
+            }
+          }
+        }
+      }
+    `,
+    PRODUCT: `
+      query getMetafields($ownerId: ID!) {
+        product(id: $ownerId) {
+          metafields(first: 50) {
+            nodes {
+              id
+              namespace
+              key
+              value
+              type
+            }
+          }
+        }
+      }
+    `,
+    PRODUCTVARIANT: `
+      query getMetafields($ownerId: ID!) {
+        productVariant(id: $ownerId) {
+          metafields(first: 50) {
+            nodes {
+              id
+              namespace
+              key
+              value
+              type
+            }
+          }
+        }
+      }
+    `,
+  };
+
+  const query = ownerTypeQueries[ownerType];
+  if (!query) {
+    return {
+      success: false,
+      error: `Unsupported owner type: ${ownerType}`,
+    };
+  }
+
+  try {
+    // Get existing metafields for this resource
+    const existingResponse = await stagingAdmin.graphql(query, {
+      variables: { ownerId },
+    });
+    const existingResult = await existingResponse.json();
+
+    console.log(
+      `Query response for ${ownerType} ${ownerId}:`,
+      JSON.stringify(existingResult, null, 2),
+    );
+
+    // Map owner type to the correct data path in the response
+    const dataPathMap = {
+      MARKET: "market",
+      PRODUCT: "product",
+      PRODUCTVARIANT: "productVariant",
+    };
+    const dataPath = dataPathMap[ownerType] || ownerType.toLowerCase();
+    const existingMetafields =
+      existingResult.data?.[dataPath]?.metafields?.nodes || [];
+
+    console.log(
+      `Found ${existingMetafields.length} existing metafields for ${ownerType} ${ownerId}`,
+    );
+
+    // Process each metafield from production
+    for (const metafield of metafields) {
+      try {
+        // Skip app-owned metafields from other apps
+        if (
+          metafield.namespace.startsWith("app--") &&
+          !metafield.namespace.includes("$app")
+        ) {
+          console.log(
+            `⚠️ Skipped metafield ${metafield.namespace}.${metafield.key} - app-owned namespace from another app`,
+          );
+          results.skipped++;
+          continue;
+        }
+
+        // Skip Shopify-reserved namespaces
+        if (
+          metafield.namespace.startsWith("shopify--") ||
+          metafield.namespace === "shopify"
+        ) {
+          console.log(
+            `⚠️ Skipped metafield ${metafield.namespace}.${metafield.key} - Shopify reserved namespace`,
+          );
+          results.skipped++;
+          continue;
+        }
+
+        // Check if metafield already exists (match by namespace and key)
+        const existingMetafield = existingMetafields.find(
+          (existing) =>
+            existing.namespace === metafield.namespace &&
+            existing.key === metafield.key,
+        );
+
+        const metafieldInput = {
+          namespace: metafield.namespace,
+          key: metafield.key,
+          value: metafield.value,
+          type: metafield.type,
+        };
+
+        console.log(
+          `Processing metafield ${metafield.namespace}.${metafield.key} with value: ${metafield.value.substring(0, 50)}...`,
+        );
+
+        if (existingMetafield) {
+          // Update existing metafield if value is different
+          if (
+            existingMetafield.value !== metafield.value ||
+            existingMetafield.type !== metafield.type
+          ) {
+            const updateMutation = `
+              mutation metafieldUpdate($metafield: MetafieldInput!) {
+                metafieldUpdate(metafield: $metafield) {
+                  metafield {
+                    id
+                    namespace
+                    key
+                    value
+                    type
+                  }
+                  userErrors {
+                    field
+                    message
+                    code
+                  }
+                }
+              }
+            `;
+
+            const updateResponse = await stagingAdmin.graphql(updateMutation, {
+              variables: {
+                metafield: {
+                  id: existingMetafield.id,
+                  ...metafieldInput,
+                },
+              },
+            });
+            const updateResult = await updateResponse.json();
+
+            if (updateResult.data?.metafieldUpdate?.userErrors?.length > 0) {
+              const errors = updateResult.data.metafieldUpdate.userErrors
+                .map((e) => e.message)
+                .join(", ");
+              results.errors.push(
+                `Failed to update metafield ${metafield.namespace}.${metafield.key}: ${errors}`,
+              );
+              results.failed++;
+            } else {
+              console.log(
+                `✅ Updated metafield ${metafield.namespace}.${metafield.key}`,
+              );
+              results.updated++;
+            }
+          } else {
+            console.log(
+              `⏭️ Skipped metafield ${metafield.namespace}.${metafield.key} - value already matches`,
+            );
+            results.skipped++;
+          }
+        } else {
+          // Create new metafield
+          const createMutation = `
+            mutation metafieldSet($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields {
+                  id
+                  namespace
+                  key
+                  value
+                  type
+                }
+                userErrors {
+                  field
+                  message
+                  code
+                }
+              }
+            }
+          `;
+
+          const createResponse = await stagingAdmin.graphql(createMutation, {
+            variables: {
+              metafields: [
+                {
+                  ownerId,
+                  ...metafieldInput,
+                },
+              ],
+            },
+          });
+          const createResult = await createResponse.json();
+
+          if (createResult.data?.metafieldsSet?.userErrors?.length > 0) {
+            const errors = createResult.data.metafieldsSet.userErrors
+              .map((e) => e.message)
+              .join(", ");
+            results.errors.push(
+              `Failed to create metafield ${metafield.namespace}.${metafield.key}: ${errors}`,
+            );
+            results.failed++;
+          } else {
+            console.log(
+              `✅ Created metafield ${metafield.namespace}.${metafield.key}`,
+            );
+            results.created++;
+          }
+        }
+      } catch (error) {
+        console.error(
+          `Error processing metafield ${metafield.namespace}.${metafield.key}:`,
+          error,
+        );
+        results.errors.push(`Metafield processing error: ${error.message}`);
+        results.failed++;
+      }
+    }
+
+    if (results.failed > 0) {
+      results.success = false;
+    }
+
+    return results;
+  } catch (error) {
+    console.error(
+      `Error syncing metafields for ${ownerType} ${ownerId}:`,
+      error,
+    );
+    return {
+      success: false,
+      error: error.message || "Unknown error occurred",
     };
   }
 }

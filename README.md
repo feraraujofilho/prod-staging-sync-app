@@ -20,6 +20,7 @@ A Shopify app that synchronizes metaobject and metafield definitions between pro
 2. **Shopify Partner Account**: [Create an account](https://partners.shopify.com/signup)
 3. **Development Store**: For testing the app
 4. **Shopify CLI**: Latest version for local development
+5. **Multi-Currency Support**: For market sync with currency settings, ensure your staging store has a payment gateway that supports multiple currencies enabled (e.g., Shopify Payments or Bogus Gateway for testing)
 
 ## Setup
 
@@ -72,7 +73,19 @@ yarn dev
 pnpm dev
 ```
 
-### 5. Access Prisma Studio (Optional)
+### 5. Enable Multi-Currency Support (For Market Sync)
+
+To properly test market currency sync, enable a multi-currency payment gateway on your staging store:
+
+**For Development/Testing:**
+1. Go to your staging store admin: `Settings > Payments`
+2. In the "Supported payment methods" section, click "Choose a payment provider"
+3. Select "Bogus Gateway" (for testing) or enable "Shopify Payments" (for production)
+4. Enable multiple currencies in `Settings > Markets > [Your Market] > Currency`
+
+**Note**: Without a multi-currency payment gateway, currency settings may not sync properly or markets may not function correctly.
+
+### 6. Access Prisma Studio (Optional)
 
 For database management and debugging during development, you can use Prisma Studio:
 
@@ -198,11 +211,12 @@ Navigate to **Sync** to synchronize definitions:
 ### Market Sync Limitations
 
 1. **Market Conditions**: Regional, location, and company location conditions are preserved
-2. **Currency Settings**: Base currency and local currency settings are synced
+2. **Currency Settings**: Base currency and local currency settings are synced using `marketUpdate` mutation (compatible with unified markets)
 3. **Web Presence**: Domain and subdomain configurations are maintained
 4. **Handle Conflicts**: Markets with existing handles are updated, new markets are created
 5. **API Version**: Uses latest GraphQL API (2025-07) for market operations
 6. **Required Scopes**: Requires `read_markets` and `write_markets` permissions
+7. **Payment Gateway Requirement**: Multi-currency markets require a payment gateway that supports multiple currencies (e.g., Shopify Payments or Bogus Gateway for testing)
 
 ### General Limitations
 
@@ -246,6 +260,17 @@ Navigate to **Sync** to synchronize definitions:
 
 - **Cause**: App doesn't have the required `read_markets` or `write_markets` scope
 - **Solution**: Reinstall the app to get the new scopes, or ensure the app has the correct permissions
+
+### "The alternate languages aren't enabled on the store" / "Default locale isn't published"
+
+- **Cause**: Web presence sync requires locales (languages) to be enabled and published on the staging store
+- **Solution**: These are automatically skipped as expected behavior. To support these locales, enable them in staging store: Settings > Languages
+- **Note**: This is normal when production and staging have different language configurations
+
+### "The following condition IDs were not found"
+
+- **Cause**: Market conditions reference specific location/company IDs that don't exist in staging
+- **Solution**: Location and company location conditions are automatically skipped during sync as they are environment-specific. Only region (country) conditions are synced.
 
 ### "Handle can't be changed in a default list"
 
