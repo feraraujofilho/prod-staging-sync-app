@@ -11,6 +11,7 @@ import {
   Layout,
   Card,
   BlockStack,
+  Box,
   Text,
   TextField,
   Button,
@@ -369,6 +370,33 @@ export default function Settings() {
             </BlockStack>
           </Card>
         </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="300">
+              <Text variant="headingMd" as="h2">
+                Required API Scopes
+              </Text>
+              <Text variant="bodyMd" as="p">
+                When creating a custom app in your source store, ensure it has
+                the following Admin API scopes:
+              </Text>
+              <Box
+                padding="300"
+                background="bg-surface-secondary"
+                borderRadius="200"
+              >
+                <Text variant="bodySm" as="p" fontFamily="monospace" breakWord>
+                  read_metaobject_definitions, read_metaobjects, read_products,
+                  read_files, read_online_store_navigation,
+                  read_online_store_pages, read_markets, read_companies,
+                  read_customers, read_locales, read_product_listings,
+                  read_locations
+                </Text>
+              </Box>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
       </Layout>
 
       <Modal
@@ -402,6 +430,19 @@ export default function Settings() {
             )}
 
             <BlockStack gap="400">
+              <Banner status="info" title="Required API Scopes">
+                <p>Make sure your custom app has these Admin API scopes:</p>
+                <Box paddingBlockStart="200">
+                  <Text variant="bodyMd" as="p" fontFamily="monospace">
+                    read_metaobject_definitions, read_metaobjects,
+                    read_products, read_files, read_online_store_navigation,
+                    read_online_store_pages, read_markets, read_companies,
+                    read_customers, read_locales, read_product_listings,
+                    read_locations
+                  </Text>
+                </Box>
+              </Banner>
+
               <TextField
                 label="Connection Name"
                 value={name}

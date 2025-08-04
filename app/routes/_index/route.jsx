@@ -19,10 +19,12 @@ export default function App() {
   return (
     <div className={styles.index}>
       <div className={styles.content}>
-        <h1 className={styles.heading}>A short heading about [your app]</h1>
+        <h1 className={styles.heading}>Store Data Sync Tool</h1>
         <p className={styles.text}>
-          A tagline about [your app] that describes your value proposition.
+          Seamlessly sync data between your production and staging Shopify
+          stores
         </p>
+
         {showForm && (
           <Form className={styles.form} method="post" action="/auth/login">
             <label className={styles.label}>
@@ -35,18 +37,107 @@ export default function App() {
             </button>
           </Form>
         )}
+
+        <h2 className={styles.subheading}>Getting Started</h2>
+
+        <div className={styles.section}>
+          <h3>Step 1: Install this app in your destination store</h3>
+          <p>
+            Install this app in the store where you want to sync data TO
+            (usually your staging or development store).
+          </p>
+        </div>
+
+        <div className={styles.section}>
+          <h3>Step 2: Create a custom app in your source store</h3>
+          <p>
+            In the store you want to sync data FROM (usually your production
+            store):
+          </p>
+          <ol className={styles.orderedList}>
+            <li>Go to Settings → Apps and sales channels → Develop apps</li>
+            <li>Click "Create an app" and give it a name like "Data Sync"</li>
+            <li>Configure Admin API scopes with these permissions:</li>
+          </ol>
+
+          <div className={styles.scopesBox}>
+            <h4>Required API Scopes:</h4>
+            <code className={styles.scopes}>
+              read_metaobject_definitions, read_metaobjects, read_products,
+              read_files, read_online_store_navigation, read_online_store_pages,
+              read_markets, read_companies, read_customers, read_locales,
+              read_product_listings, read_locations
+            </code>
+          </div>
+
+          <ol className={styles.orderedList} start="4">
+            <li>Install the app and generate Admin API access token</li>
+            <li>
+              Save the access token - you'll need it to connect the stores
+            </li>
+          </ol>
+        </div>
+
+        <div className={styles.section}>
+          <h3>Step 3: Connect your stores</h3>
+          <p>
+            Once logged in to this app, go to Settings and add your production
+            store connection using the access token from Step 2.
+          </p>
+        </div>
+
+        <h2 className={styles.subheading}>How It Works</h2>
+
         <ul className={styles.list}>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>One-way sync</strong>: Data flows from your production store
+            to your staging store, never the reverse.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Selective sync</strong>: Choose exactly what data types you
+            want to sync - products, collections, navigation menus, and more.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Safe operation</strong>: The app only reads from production
+            and writes to staging, protecting your live store data.
+          </li>
+          <li>
+            <strong>Comprehensive sync</strong>: Includes metafields, images,
+            variants, and all associated data.
+          </li>
+        </ul>
+
+        <h2 className={styles.subheading}>Available Sync Types</h2>
+
+        <ul className={styles.list}>
+          <li>
+            <strong>Products</strong> - Complete product catalog with variants,
+            images, and metafields
+          </li>
+          <li>
+            <strong>Collections</strong> - Smart and manual collections with
+            rules and products
+          </li>
+          <li>
+            <strong>Navigation</strong> - Online store navigation menus
+          </li>
+          <li>
+            <strong>Pages</strong> - Online store pages and content
+          </li>
+          <li>
+            <strong>Markets</strong> - International markets and regions
+          </li>
+          <li>
+            <strong>Locations</strong> - Store locations for inventory
+          </li>
+          <li>
+            <strong>Metafield Definitions</strong> - Custom field structures
+          </li>
+          <li>
+            <strong>Metaobject Definitions</strong> - Custom data structures
+          </li>
+          <li>
+            <strong>Theme Images</strong> - Images uploaded via theme editor
           </li>
         </ul>
       </div>
