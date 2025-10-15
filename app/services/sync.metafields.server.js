@@ -1,4 +1,44 @@
 // Service for syncing metafield definitions between stores
+// Add near the top of the file
+export const NON_PRODUCT_OWNER_TYPES = [
+  "API_PERMISSION",
+  "ARTICLE",
+  "BLOG",
+  "CARTTRANSFORM",
+  "COLLECTION",
+  "COMPANY",
+  "COMPANY_LOCATION",
+  "CUSTOMER",
+  "DELIVERY_CUSTOMIZATION",
+  "DISCOUNT",
+  "DRAFTORDER",
+  "FULFILLMENT_CONSTRAINT_RULE",
+  "GIFT_CARD_TRANSACTION",
+  "LOCATION",
+  "MARKET",
+  "MEDIA_IMAGE",
+  "ORDER",
+  "ORDER_ROUTING_LOCATION_RULE",
+  "PAGE",
+  "PAYMENT_CUSTOMIZATION",
+  "SELLING_PLAN",
+  "SHOP",
+  "VALIDATION",
+];
+
+// Optional helper to run everything except product/variant
+export async function syncAllNonProductMetafieldDefinitions(
+  productionStore,
+  accessToken,
+  stagingAdmin,
+) {
+  return await syncMetafieldDefinitions(
+    productionStore,
+    accessToken,
+    stagingAdmin,
+    NON_PRODUCT_OWNER_TYPES,
+  );
+}
 
 // Get metafield definitions from external store
 async function getMetafieldDefinitions(ownerType, store, token) {
@@ -37,7 +77,7 @@ async function getMetafieldDefinitions(ownerType, store, token) {
   while (hasNextPage) {
     try {
       const response = await fetch(
-        `https://${store}/admin/api/2025-01/graphql.json`,
+        `https://${store}/admin/api/2025-07/graphql.json`,
         {
           method: "POST",
           headers: {
@@ -346,7 +386,7 @@ export async function syncMetafieldDefinitions(
   productionStore,
   accessToken,
   stagingAdmin,
-  ownerType = "PRODUCT",
+  ownerType,
 ) {
   // Handle array of owner types by calling this function for each type
   if (Array.isArray(ownerType)) {
@@ -1086,10 +1126,11 @@ export async function syncMetafieldValues(
             existingMetafield.value !== metafield.value ||
             existingMetafield.type !== metafield.type
           ) {
+            // Use metafieldsSet for updating (it will update if ID is provided)
             const updateMutation = `
-              mutation metafieldUpdate($metafield: MetafieldInput!) {
-                metafieldUpdate(metafield: $metafield) {
-                  metafield {
+              mutation metafieldSet($metafields: [MetafieldsSetInput!]!) {
+                metafieldsSet(metafields: $metafields) {
+                  metafields {
                     id
                     namespace
                     key
@@ -1107,16 +1148,18 @@ export async function syncMetafieldValues(
 
             const updateResponse = await stagingAdmin.graphql(updateMutation, {
               variables: {
-                metafield: {
-                  id: existingMetafield.id,
-                  ...metafieldInput,
-                },
+                metafields: [
+                  {
+                    ownerId,
+                    ...metafieldInput,
+                  },
+                ],
               },
             });
             const updateResult = await updateResponse.json();
 
-            if (updateResult.data?.metafieldUpdate?.userErrors?.length > 0) {
-              const errors = updateResult.data.metafieldUpdate.userErrors
+            if (updateResult.data?.metafieldsSet?.userErrors?.length > 0) {
+              const errors = updateResult.data.metafieldsSet.userErrors
                 .map((e) => e.message)
                 .join(", ");
               results.errors.push(

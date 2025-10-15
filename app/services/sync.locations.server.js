@@ -1,5 +1,7 @@
 // Location sync service - handles syncing locations between stores
 
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
+
 /**
  * Get all locations from production store
  * @param {string} productionStore - The production store domain
@@ -245,7 +247,8 @@ export async function syncLocations(
   productionStore,
   accessToken,
   stagingAdmin,
-  onProgress,
+  storeConnectionId = null,
+  onProgress = () => {},
 ) {
   const summary = {
     total: 0,
@@ -326,6 +329,28 @@ export async function syncLocations(
           message: `✓ Location "${prodLocation.name}" already exists in staging`,
           success: true,
         });
+
+        // Save mapping for matched location
+        if (storeConnectionId) {
+          try {
+            await saveMapping(storeConnectionId, "location", {
+              productionId: extractIdFromGid(prodLocation.id),
+              stagingId: extractIdFromGid(existingLocation.id),
+              productionGid: prodLocation.id,
+              stagingGid: existingLocation.id,
+              matchKey: "name",
+              matchValue: prodLocation.name,
+              syncId: null,
+              title: prodLocation.name,
+            });
+            console.log(`✅ Saved mapping for location: ${prodLocation.name}`);
+          } catch (mappingError) {
+            console.error(
+              `⚠️ Failed to save mapping for location ${prodLocation.name}:`,
+              mappingError.message,
+            );
+          }
+        }
       } else {
         // Create the location
         try {
@@ -344,6 +369,30 @@ export async function syncLocations(
               address: createdLocation.address,
             },
           });
+
+          // Save mapping for created location
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "location", {
+                productionId: extractIdFromGid(prodLocation.id),
+                stagingId: extractIdFromGid(createdLocation.id),
+                productionGid: prodLocation.id,
+                stagingGid: createdLocation.id,
+                matchKey: "name",
+                matchValue: prodLocation.name,
+                syncId: null,
+                title: prodLocation.name,
+              });
+              console.log(
+                `✅ Saved mapping for location: ${prodLocation.name}`,
+              );
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for location ${prodLocation.name}:`,
+                mappingError.message,
+              );
+            }
+          }
         } catch (error) {
           summary.failed++;
           summary.errors.push({

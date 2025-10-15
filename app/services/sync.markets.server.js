@@ -7,6 +7,261 @@ import {
   syncMetafieldValues,
   syncMetafieldDefinitions,
 } from "./sync.metafields.server.js";
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
+
+/**
+ * Fetch the primary catalog and curated product handles for a production market.
+ * Returns { title, status, currency, productHandles } or null if none.
+ */
+async function getProductionMarketCatalog(
+  productionStore,
+  accessToken,
+  marketId,
+) {
+  const query = `
+    query GetMarketCatalog($id: ID!, $after: String) {
+      market(id: $id) {
+        catalogs(first: 5) {
+          nodes {
+            id
+            title
+            status
+            priceList { currency }
+            publication {
+              id
+              products(first: 250, after: $after) {
+                nodes { id handle }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    // First request to get catalog metadata and first page of products
+    let after = null;
+    let productHandles = [];
+    let chosenCatalog = null;
+
+    // We may need more than one request to paginate products.
+    while (true) {
+      const response = await fetch(
+        `https://${productionStore}/admin/api/2025-07/graphql.json`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": accessToken,
+          },
+          body: JSON.stringify({ query, variables: { id: marketId, after } }),
+        },
+      );
+
+      const data = await response.json();
+      if (data.errors) {
+        const msg = data.errors.map((e) => e.message).join(", ");
+        throw new Error(`GraphQL errors: ${msg}`);
+      }
+
+      const catalogs = data.data?.market?.catalogs?.nodes || [];
+      if (!chosenCatalog) {
+        // prefer ACTIVE catalog, else first
+        chosenCatalog =
+          catalogs.find((c) => c.status === "ACTIVE") || catalogs[0] || null;
+        if (!chosenCatalog) return null;
+      }
+
+      const currentProducts = chosenCatalog.publication?.products;
+      if (currentProducts?.nodes?.length) {
+        productHandles.push(
+          ...currentProducts.nodes.map((p) => p.handle).filter(Boolean),
+        );
+      }
+
+      const pageInfo = currentProducts?.pageInfo;
+      if (pageInfo?.hasNextPage) {
+        after = pageInfo.endCursor;
+        // loop continues with updated cursor
+      } else {
+        break;
+      }
+    }
+
+    return {
+      title: chosenCatalog.title,
+      status: chosenCatalog.status,
+      currency: chosenCatalog.priceList?.currency || null,
+      productHandles,
+    };
+  } catch (error) {
+    console.warn(
+      `[MARKETS DEBUG] Failed to read production catalog for market ${marketId}:`,
+      error.message,
+    );
+    return null;
+  }
+}
+
+/**
+ * Resolve product IDs in staging by handles.
+ */
+async function resolveStagingProductIdsByHandles(stagingAdmin, handles) {
+  const ids = [];
+  for (const handle of handles) {
+    const q = `
+      query($handle: String!) {
+        product: productByIdentifier(identifier:{ handle: $handle }) { id }
+      }
+    `;
+    try {
+      const resp = await stagingAdmin.graphql(q, { variables: { handle } });
+      const json = await resp.json();
+      const id = json.data?.product?.id;
+      if (id) ids.push(id);
+    } catch (e) {
+      console.warn(
+        `[MARKETS DEBUG] Failed to resolve handle ${handle}:`,
+        e.message,
+      );
+    }
+  }
+  return ids;
+}
+
+/**
+ * Create a catalog on staging for a market, attach a publication and price list,
+ * and populate the curated product set.
+ */
+async function ensureStagingCatalogWithCuratedPublication(
+  stagingAdmin,
+  marketId,
+  marketName,
+  baseCurrencyCode,
+  productHandles,
+) {
+  // Create catalog (assign directly to market context)
+  const catalogCreate = `
+    mutation($title:String!, $marketId:ID!) {
+      catalogCreate(input:{ title:$title, status: ACTIVE, context:{ marketIds: [$marketId] }}) {
+        catalog { id title status }
+        userErrors { field message code }
+      }
+    }
+  `;
+
+  const title = `Synced ${marketName}`.slice(0, 60);
+  const catalogResp = await stagingAdmin.graphql(catalogCreate, {
+    variables: { title, marketId },
+  });
+  const catalogJson = await catalogResp.json();
+  if (catalogJson.data?.catalogCreate?.userErrors?.length) {
+    const msg = catalogJson.data.catalogCreate.userErrors
+      .map((e) => e.message)
+      .join(", ");
+    console.warn(
+      `[MARKETS DEBUG] catalogCreate errors for ${marketName}:`,
+      msg,
+    );
+  }
+  const catalogId = catalogJson.data?.catalogCreate?.catalog?.id;
+  if (!catalogId) {
+    return { success: false, error: "Failed to create catalog" };
+  }
+
+  console.log(`[MARKETS DEBUG] Created catalog ${catalogId} for ${marketName}`);
+
+  // Create publication with NONE default state (curated)
+  const publicationCreate = `
+    mutation($catalogId:ID!) {
+      publicationCreate(input:{ catalogId: $catalogId, defaultState: NONE, autoPublish: true }) {
+        publication { id }
+        userErrors { field message }
+      }
+    }
+  `;
+  const pubResp = await stagingAdmin.graphql(publicationCreate, {
+    variables: { catalogId },
+  });
+  const pubJson = await pubResp.json();
+  const publicationId = pubJson.data?.publicationCreate?.publication?.id;
+  if (!publicationId) {
+    return { success: false, error: "Failed to create publication" };
+  }
+
+  // Create a price list (optional but explicit) – requires currency match
+  if (baseCurrencyCode) {
+    const priceListCreate = `
+      mutation($name:String!, $currency:CurrencyCode!, $catalogId:ID!) {
+        priceListCreate(input:{ name:$name, currency:$currency, catalogId:$catalogId }) {
+          priceList { id }
+          userErrors { field message }
+        }
+      }
+    `;
+    const plResp = await stagingAdmin.graphql(priceListCreate, {
+      variables: {
+        name: `${marketName} prices`.slice(0, 60),
+        currency: baseCurrencyCode,
+        catalogId,
+      },
+    });
+    const plJson = await plResp.json();
+    if (plJson.data?.priceListCreate?.userErrors?.length) {
+      console.warn(
+        `[MARKETS DEBUG] priceListCreate errors for ${marketName}:`,
+        plJson.data.priceListCreate.userErrors.map((e) => e.message).join(", "),
+      );
+    }
+  }
+
+  // Resolve staging product IDs by handle and publish in chunks
+  const stagingIds = await resolveStagingProductIdsByHandles(
+    stagingAdmin,
+    productHandles,
+  );
+  console.log(
+    `[MARKETS DEBUG] Resolved ${stagingIds.length}/${productHandles.length} products for ${marketName}`,
+  );
+
+  const chunk = (arr, size) =>
+    arr.reduce(
+      (acc, _, i) => (i % size ? acc : [...acc, arr.slice(i, i + size)]),
+      [],
+    );
+  const chunks = chunk(stagingIds, 200);
+
+  const publicationUpdate = `
+    mutation($id:ID!, $ids:[ID!]!) {
+      publicationUpdate(id:$id, input:{ publishablesToAdd: $ids }) {
+        userErrors { field message }
+      }
+    }
+  `;
+  for (const ids of chunks) {
+    const uResp = await stagingAdmin.graphql(publicationUpdate, {
+      variables: { id: publicationId, ids },
+    });
+    const uJson = await uResp.json();
+    if (uJson.data?.publicationUpdate?.userErrors?.length) {
+      console.warn(
+        `[MARKETS DEBUG] publicationUpdate errors:`,
+        uJson.data.publicationUpdate.userErrors
+          .map((e) => e.message)
+          .join(", "),
+      );
+    }
+  }
+
+  return {
+    success: true,
+    catalogId,
+    publicationId,
+    published: stagingIds.length,
+  };
+}
 
 /**
  * Get all markets from production store
@@ -122,43 +377,6 @@ async function getProductionMarkets(productionStore, accessToken) {
 }
 
 /**
- * Get all markets from staging store
- * @param {Object} stagingAdmin - Shopify admin API client for staging
- * @returns {Promise<Array>} Array of market objects
- */
-async function getStagingMarkets(stagingAdmin) {
-  const query = `
-    query GetStagingMarkets($first: Int!) {
-      markets(first: $first) {
-        edges {
-          node {
-            id
-            handle
-            name
-            status
-          }
-        }
-      }
-    }
-  `;
-
-  try {
-    const variables = { first: 250 };
-    const response = await stagingAdmin.graphql(query, { variables });
-    const result = await response.json();
-
-    if (result.data?.markets?.edges) {
-      return result.data.markets.edges.map((edge) => edge.node);
-    }
-
-    return [];
-  } catch (error) {
-    console.error("Error fetching staging markets:", error);
-    throw error;
-  }
-}
-
-/**
  * Check if a market exists in staging by handle
  * @param {string} handle - The market handle
  * @param {Object} stagingAdmin - Shopify admin API client for staging
@@ -208,7 +426,6 @@ async function getStagingMarketByHandle(handle, stagingAdmin) {
  * @returns {Promise<Object>} Result object with success status and market data
  */
 async function createMarketInStaging(market, stagingAdmin) {
-  console.log("MAAARKET IN FUNCTION", market);
   const mutation = `
     mutation marketCreate($input: MarketCreateInput!) {
       marketCreate(input: $input) {
@@ -524,10 +741,12 @@ async function enableAndPublishLocale(locale, stagingAdmin) {
         .map((e) => e.message)
         .join(", ");
 
-      // If locale is already enabled, that's fine
+      // If locale is already enabled or is the primary locale, treat as no-op
       if (
         !errors.includes("already enabled") &&
-        !errors.includes("already exists")
+        !errors.includes("already exists") &&
+        !errors.toLowerCase().includes("primary locale") &&
+        !errors.toLowerCase().includes("can't be changed")
       ) {
         return {
           success: false,
@@ -566,6 +785,13 @@ async function enableAndPublishLocale(locale, stagingAdmin) {
       const errors = publishResult.data.shopLocaleUpdate.userErrors
         .map((e) => e.message)
         .join(", ");
+      // Primary locale cannot be changed via endpoint; treat as no-op
+      if (
+        errors.toLowerCase().includes("primary locale") ||
+        errors.toLowerCase().includes("can't be changed")
+      ) {
+        return { success: true, locale };
+      }
       return {
         success: false,
         error: `Failed to publish locale ${locale}: ${errors}`,
@@ -884,6 +1110,7 @@ export async function syncMarkets(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
   onProgress = () => {},
 ) {
   const log = [];
@@ -1057,6 +1284,28 @@ export async function syncMarkets(
             message: `✅ Successfully updated market: ${market.name}`,
             success: true,
           });
+
+          // Save mapping for updated market
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "market", {
+                productionId: extractIdFromGid(market.id),
+                stagingId: extractIdFromGid(existingMarket.id),
+                productionGid: market.id,
+                stagingGid: existingMarket.id,
+                matchKey: "handle",
+                matchValue: market.handle,
+                syncId: null,
+                title: market.name,
+              });
+              console.log(`✅ Saved mapping for market: ${market.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for market ${market.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
 
           // Sync currency settings after successful market update
           if (market.currencySettings) {
@@ -1234,6 +1483,60 @@ export async function syncMarkets(
               });
             }
           }
+
+          // Unified Markets: create curated catalog mirroring production publication (subfolders only)
+          try {
+            const featuresQuery = `query { shop { features { unifiedMarkets } } }`;
+            const featResp = await stagingAdmin.graphql(featuresQuery);
+            const featJson = await featResp.json();
+            const isUnified = !!featJson.data?.shop?.features?.unifiedMarkets;
+            console.log(`[MARKETS DEBUG] unifiedMarkets: ${isUnified}`);
+            if (isUnified) {
+              const prodCat = await getProductionMarketCatalog(
+                productionStore,
+                accessToken,
+                market.id,
+              );
+              if (prodCat) {
+                console.log(
+                  `[MARKETS DEBUG] Production catalog for ${market.name}:`,
+                  {
+                    title: prodCat.title,
+                    currency: prodCat.currency,
+                    products: prodCat.productHandles.length,
+                  },
+                );
+                const ensureRes =
+                  await ensureStagingCatalogWithCuratedPublication(
+                    stagingAdmin,
+                    existingMarket.id,
+                    market.name,
+                    prodCat.currency,
+                    prodCat.productHandles,
+                  );
+                if (!ensureRes.success) {
+                  console.warn(
+                    `[MARKETS DEBUG] Failed to ensure curated catalog for ${market.name}:`,
+                    ensureRes.error,
+                  );
+                } else {
+                  console.log(
+                    `[MARKETS DEBUG] Curated catalog created for ${market.name}:`,
+                    ensureRes,
+                  );
+                }
+              } else {
+                console.log(
+                  `[MARKETS DEBUG] No production catalog found for ${market.name}; skipping curated publication sync`,
+                );
+              }
+            }
+          } catch (e) {
+            console.warn(
+              `[MARKETS DEBUG] Catalog sync error for ${market.name}:`,
+              e.message,
+            );
+          }
         } else {
           summary.failed++;
           const errorMessage = `Failed to update market "${market.name}" (handle: ${market.handle}): ${result.error}`;
@@ -1261,6 +1564,28 @@ export async function syncMarkets(
             message: `✅ Successfully created market: ${market.name}`,
             success: true,
           });
+
+          // Save mapping for created market
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "market", {
+                productionId: extractIdFromGid(market.id),
+                stagingId: extractIdFromGid(result.market.id),
+                productionGid: market.id,
+                stagingGid: result.market.id,
+                matchKey: "handle",
+                matchValue: market.handle,
+                syncId: null,
+                title: market.name,
+              });
+              console.log(`✅ Saved mapping for market: ${market.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for market ${market.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
 
           // Sync currency settings after successful market creation
           if (market.currencySettings && result.market?.id) {
@@ -1438,6 +1763,60 @@ export async function syncMarkets(
                 },
               });
             }
+          }
+
+          // Unified Markets: curated catalog for newly created market
+          try {
+            const featuresQuery = `query { shop { features { unifiedMarkets } } }`;
+            const featResp = await stagingAdmin.graphql(featuresQuery);
+            const featJson = await featResp.json();
+            const isUnified = !!featJson.data?.shop?.features?.unifiedMarkets;
+            console.log(`[MARKETS DEBUG] unifiedMarkets: ${isUnified}`);
+            if (isUnified) {
+              const prodCat = await getProductionMarketCatalog(
+                productionStore,
+                accessToken,
+                market.id,
+              );
+              if (prodCat) {
+                console.log(
+                  `[MARKETS DEBUG] Production catalog for ${market.name}:`,
+                  {
+                    title: prodCat.title,
+                    currency: prodCat.currency,
+                    products: prodCat.productHandles.length,
+                  },
+                );
+                const ensureRes =
+                  await ensureStagingCatalogWithCuratedPublication(
+                    stagingAdmin,
+                    result.market.id,
+                    market.name,
+                    prodCat.currency,
+                    prodCat.productHandles,
+                  );
+                if (!ensureRes.success) {
+                  console.warn(
+                    `[MARKETS DEBUG] Failed to ensure curated catalog for ${market.name}:`,
+                    ensureRes.error,
+                  );
+                } else {
+                  console.log(
+                    `[MARKETS DEBUG] Curated catalog created for ${market.name}:`,
+                    ensureRes,
+                  );
+                }
+              } else {
+                console.log(
+                  `[MARKETS DEBUG] No production catalog found for ${market.name}; skipping curated publication sync`,
+                );
+              }
+            }
+          } catch (e) {
+            console.warn(
+              `[MARKETS DEBUG] Catalog sync error for ${market.name}:`,
+              e.message,
+            );
           }
         } else {
           summary.failed++;

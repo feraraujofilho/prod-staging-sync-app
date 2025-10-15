@@ -1,14 +1,17 @@
 import crypto from "crypto";
 
-// Use environment variable for encryption key, or generate one
+// Use environment variable for encryption key; require it in non-test environments
 const ENCRYPTION_KEY =
-  process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex");
+  process.env.ENCRYPTION_KEY ||
+  (process.env.NODE_ENV === "test"
+    ? crypto.randomBytes(32).toString("hex")
+    : null);
 
-console.log(
-  "ENCRYPTION_KEY from env:",
-  process.env.ENCRYPTION_KEY ? "loaded" : "not loaded",
-);
-console.log("ENCRYPTION_KEY length:", ENCRYPTION_KEY.length);
+if (!ENCRYPTION_KEY) {
+  throw new Error(
+    "ENCRYPTION_KEY environment variable is required for token encryption.",
+  );
+}
 
 // Convert hex string to Buffer for use with crypto functions
 const getKeyBuffer = () => {
@@ -21,6 +24,18 @@ const getKeyBuffer = () => {
 };
 
 const IV_LENGTH = 16; // For AES, this is always 16
+
+function isHex(str) {
+  return /^[0-9a-fA-F]+$/.test(str);
+}
+
+function isProbablyEncrypted(text) {
+  if (typeof text !== "string") return false;
+  const idx = text.indexOf(":");
+  if (idx === -1) return false;
+  const ivHex = text.slice(0, idx);
+  return ivHex.length === IV_LENGTH * 2 && isHex(ivHex);
+}
 
 export function encrypt(text) {
   if (!text) return null;
@@ -38,6 +53,11 @@ export function decrypt(text) {
   if (!text) return null;
 
   try {
+    // Backward compatibility: if value doesn't look encrypted, treat it as plaintext
+    if (!isProbablyEncrypted(text)) {
+      return text;
+    }
+
     const textParts = text.split(":");
     const iv = Buffer.from(textParts.shift(), "hex");
     const encryptedText = Buffer.from(textParts.join(":"), "hex");

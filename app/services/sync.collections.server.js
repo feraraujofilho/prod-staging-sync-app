@@ -7,6 +7,7 @@ import {
   syncMetafieldValues,
   syncMetafieldDefinitions,
 } from "./sync.metafields.server.js";
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 
 /**
  * Get all collections from production store
@@ -183,8 +184,8 @@ async function findStagingProductsByHandles(productHandles, stagingAdmin) {
   }
 
   const query = `
-    query GetProductsByHandles($handles: [String!]!) {
-      products(first: 250, query: $handles) {
+    query GetProductsByHandles($queryString: String!) {
+      products(first: 250, query: $queryString) {
         edges {
           node {
             id
@@ -204,7 +205,7 @@ async function findStagingProductsByHandles(productHandles, stagingAdmin) {
     console.log(`Searching for products with query: ${handleQuery}`);
     console.log(`Product handles to find: ${productHandles.join(", ")}`);
 
-    const variables = { handles: handleQuery };
+    const variables = { queryString: handleQuery };
     const response = await stagingAdmin.graphql(query, { variables });
     const result = await response.json();
 
@@ -492,6 +493,7 @@ export async function syncCollections(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
   onProgress = () => {},
 ) {
   const log = [];
@@ -669,6 +671,30 @@ export async function syncCollections(
             success: true,
           });
 
+          // Save mapping for updated collection
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "collection", {
+                productionId: extractIdFromGid(collection.id),
+                stagingId: extractIdFromGid(existingCollection.id),
+                productionGid: collection.id,
+                stagingGid: existingCollection.id,
+                matchKey: "handle",
+                matchValue: collection.handle,
+                syncId: null,
+                title: collection.title,
+              });
+              console.log(
+                `✅ Saved mapping for collection: ${collection.handle}`,
+              );
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for collection ${collection.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
+
           // Add products to manual collections (smart collections handle this automatically)
           if (
             collection.products?.edges?.length > 0 &&
@@ -795,6 +821,30 @@ export async function syncCollections(
             message: `✅ Successfully created collection: ${collection.title}`,
             success: true,
           });
+
+          // Save mapping for created collection
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "collection", {
+                productionId: extractIdFromGid(collection.id),
+                stagingId: extractIdFromGid(result.collection.id),
+                productionGid: collection.id,
+                stagingGid: result.collection.id,
+                matchKey: "handle",
+                matchValue: collection.handle,
+                syncId: null,
+                title: collection.title,
+              });
+              console.log(
+                `✅ Saved mapping for collection: ${collection.handle}`,
+              );
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for collection ${collection.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
 
           // Add products to manual collections (smart collections handle this automatically)
           if (

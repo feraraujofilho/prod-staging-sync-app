@@ -32,18 +32,20 @@ model Session {
 }
 
 model StoreConnection {
-  id              String    @id @default(cuid())
-  shop            String    // The shop that owns this connection
-  name            String    // Friendly name for the connection
-  storeDomain     String    // Production store domain
-  encryptedToken  String    // Encrypted access token
-  environment     String    @default("production") // production, staging, etc.
-  isActive        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id                 String              @id @default(cuid())
+  shop               String              // The shop that owns this connection
+  name               String              // Friendly name for the connection
+  storeDomain        String              // Production store domain
+  encryptedToken     String              // Encrypted access token
+  environment        String              @default("production") // production, staging, etc.
+  isActive           Boolean             @default(true)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
 
   // Relations
-  syncLogs        SyncLog[]
+  syncLogs           SyncLog[]
+  resourceMappings   ResourceMapping[]
+  unmappedReferences UnmappedReference[]
 
   @@unique([shop, storeDomain])
   @@index([shop])
@@ -65,4 +67,48 @@ model SyncLog {
 
   @@index([shop, syncType])
   @@index([connectionId])
+}
+
+// Resource mapping for tracking production -> staging ID mappings
+model ResourceMapping {
+  id                String   @id @default(cuid())
+  resourceType      String   // 'product', 'collection', 'market', 'location', 'page', 'file', 'metaobject', 'variant', 'navigation'
+  productionId      String   // Shopify ID from production (numeric part)
+  stagingId         String   // Shopify ID from staging (numeric part)
+  productionGid     String   // Full GID from production
+  stagingGid        String   // Full GID from staging
+  matchKey          String   // The actual key used for matching (handle, name, filename, type, etc.)
+  matchValue        String   // The value of the match key
+  syncId            String?  // Optional sync identifier (from custom.custom_id metafield if present)
+  title             String?  // Resource title for display
+  storeConnectionId String
+  lastSyncedAt      DateTime @default(now())
+  metadata          String?  // JSON for additional data (e.g., selectedOptions for variants)
+
+  storeConnection   StoreConnection @relation(fields: [storeConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([storeConnectionId, resourceType, productionId])
+  @@index([storeConnectionId, resourceType])
+  @@index([storeConnectionId, matchKey, matchValue])
+  @@index([syncId])
+}
+
+// Track unmapped GID references found during sync
+model UnmappedReference {
+  id                String   @id @default(cuid())
+  storeConnectionId String
+  resourceType      String   // Extracted from GID (e.g., 'Product', 'Collection')
+  productionGid     String   // The GID that couldn't be mapped
+  productionId      String   // Numeric ID from the GID
+  context           String   // Where it was found (e.g., "product:123 metafield:custom.related_products")
+  foundInSyncType   String   // Which sync found it (e.g., "products", "collections")
+  attemptedAt       DateTime @default(now())
+  resolved          Boolean  @default(false)
+  resolvedAt        DateTime?
+
+  storeConnection   StoreConnection @relation(fields: [storeConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([storeConnectionId, productionGid, context])
+  @@index([storeConnectionId, resolved])
+  @@index([resourceType, resolved])
 }

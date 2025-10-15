@@ -35,7 +35,6 @@ import prisma from "../db.server";
 
 // Loader to fetch existing connections
 export const loader = async ({ request }) => {
-  const { decrypt } = await import("../utils/encryption.server");
   const { session } = await authenticate.admin(request);
 
   const connections = await prisma.storeConnection.findMany({
@@ -57,7 +56,7 @@ export const loader = async ({ request }) => {
 
 // Action to handle CRUD operations
 export const action = async ({ request }) => {
-  // const { encrypt } = await import("../utils/encryption.server");
+  const { encrypt } = await import("../utils/encryption.server");
   const { session } = await authenticate.admin(request);
   const formData = await request.formData();
   const action = formData.get("action");
@@ -96,7 +95,7 @@ export const action = async ({ request }) => {
 
         // Only update token if provided
         if (accessToken) {
-          data.encryptedToken = /* encrypt(accessToken) */ accessToken;
+          data.encryptedToken = encrypt(accessToken);
         }
 
         if (id) {
@@ -256,12 +255,15 @@ export default function Settings() {
   const rows = connections.map((connection) => [
     connection.name,
     connection.storeDomain,
-    <Badge status={connection.isActive ? "success" : "default"}>
+    <Badge
+      key={`status-${connection.id}`}
+      status={connection.isActive ? "success" : "default"}
+    >
       {connection.isActive ? "Active" : "Inactive"}
     </Badge>,
     connection.environment,
     new Date(connection.createdAt).toLocaleDateString(),
-    <ButtonGroup>
+    <ButtonGroup key={`actions-${connection.id}`}>
       <Button size="slim" onClick={() => handleEdit(connection)}>
         <Icon source={EditIcon} />
       </Button>

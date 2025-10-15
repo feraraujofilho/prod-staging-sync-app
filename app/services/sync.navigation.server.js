@@ -1,11 +1,11 @@
-import { json } from "@remix-run/node";
-
 /**
  * Fetch all navigation menus from production store
  * @param {string} productionStore - The production store domain
  * @param {string} accessToken - The production store access token
  * @returns {Promise<Array>} Array of navigation menus
  */
+
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 async function getProductionMenus(productionStore, accessToken) {
   const query = `
     query GetMenus {
@@ -484,14 +484,18 @@ async function updateMenuInStaging(menuId, menu, stagingAdmin) {
     });
   }
 
-  const variables = {
+  // For default menus, omit handle to avoid "Handle can't be changed/default list" errors
+  const baseVariables = {
     id: menuId,
     title: menu.title,
-    handle: menu.handle,
     items: processedItems,
   };
+  const includeHandle = !menu.isDefault;
+  const variables = includeHandle
+    ? { ...baseVariables, handle: menu.handle }
+    : baseVariables;
 
-  const response = await stagingAdmin.graphql(mutation, { variables });
+  let response = await stagingAdmin.graphql(mutation, { variables });
   const result = await response.json();
 
   if (result.errors) {
@@ -503,19 +507,50 @@ async function updateMenuInStaging(menuId, menu, stagingAdmin) {
 
   const userErrors = result.data?.menuUpdate?.userErrors || [];
   if (userErrors.length > 0) {
+    const messages = userErrors.map((e) => e.message);
+    const handleProblem =
+      includeHandle &&
+      (messages.some((m) => m.includes("Handle can't be changed")) ||
+        messages.some((m) => m.includes("default list")));
+
+    // Retry once without handle if we hit a handle restriction
+    if (handleProblem) {
+      console.log(
+        `Menu update encountered handle restriction for "${menu.title}". Retrying without handle...`,
+      );
+      response = await stagingAdmin.graphql(mutation, {
+        variables: baseVariables,
+      });
+      const retryResult = await response.json();
+      if (retryResult.errors) {
+        return {
+          success: false,
+          errors: retryResult.errors.map((e) => e.message).join(", "),
+        };
+      }
+      const retryErrors = retryResult.data?.menuUpdate?.userErrors || [];
+      if (retryErrors.length === 0 && retryResult.data?.menuUpdate?.menu) {
+        return { success: true, menu: retryResult.data.menuUpdate.menu };
+      }
+      const retryDetailed = retryErrors
+        .map((e) =>
+          e.field
+            ? `${e.field}: ${e.message}${e.code ? ` (${e.code})` : ""}`
+            : e.message,
+        )
+        .join(", ");
+      return { success: false, errors: retryDetailed };
+    }
+
     const detailedErrors = userErrors
-      .map((e) => {
-        if (e.field) {
-          return `${e.field}: ${e.message}${e.code ? ` (${e.code})` : ""}`;
-        }
-        return e.message;
-      })
+      .map((e) =>
+        e.field
+          ? `${e.field}: ${e.message}${e.code ? ` (${e.code})` : ""}`
+          : e.message,
+      )
       .join(", ");
 
-    return {
-      success: false,
-      errors: detailedErrors,
-    };
+    return { success: false, errors: detailedErrors };
   }
 
   const updatedMenu = result.data?.menuUpdate?.menu;
@@ -544,6 +579,7 @@ export async function syncNavigationMenus(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
   onProgress = () => {},
 ) {
   const log = [];
@@ -619,8 +655,6 @@ export async function syncNavigationMenus(
 
       // Try to update or create the menu, handling restricted handles dynamically
       let result;
-      let menuId;
-      let isRestrictedHandle = false;
 
       // Check if menu already exists in staging
       const existingMenu = await getStagingMenuByHandle(
@@ -638,69 +672,45 @@ export async function syncNavigationMenus(
         result = await updateMenuInStaging(existingMenu.id, menu, stagingAdmin);
 
         if (result.success) {
-          menuId = existingMenu.id;
           summary.updated++;
           log.push({
             timestamp: new Date().toISOString(),
             message: `✅ Successfully updated menu: ${menu.title}`,
             success: true,
           });
-        } else {
-          // Check if the error is due to handle restrictions
-          if (
-            result.errors.includes("Handle can't be changed") ||
-            result.errors.includes("default list")
-          ) {
-            isRestrictedHandle = true;
-            log.push({
-              timestamp: new Date().toISOString(),
-              message: `Menu "${menu.title}" has restricted handle, creating new one: ${menu.title}`,
-            });
 
-            const newMenu = {
-              ...menu,
-              handle: `${menu.handle}-imported-${Date.now()}`,
-            };
-
-            result = await createMenuInStaging(newMenu, stagingAdmin);
-
-            if (result.success) {
-              menuId = result.menu.id;
-              summary.created++;
-              log.push({
-                timestamp: new Date().toISOString(),
-                message: `✅ Created new menu for restricted handle: ${menu.title} (handle: ${newMenu.handle})`,
-                success: true,
+          // Save mapping for updated menu
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "navigation", {
+                productionId: extractIdFromGid(menu.id),
+                stagingId: extractIdFromGid(existingMenu.id),
+                productionGid: menu.id,
+                stagingGid: existingMenu.id,
+                matchKey: "handle",
+                matchValue: menu.handle,
+                syncId: null,
+                title: menu.title,
               });
-
-              // Log the new menu for manual configuration
-              log.push({
-                timestamp: new Date().toISOString(),
-                message: `Restricted menu "${menu.handle}" imported as "${newMenu.handle}" (ID: ${menuId})`,
-              });
-            } else {
-              summary.failed++;
-              const errorMessage = `Failed to create new menu for restricted handle "${menu.title}" (handle: ${newMenu.handle}): ${result.errors}`;
-              summary.errors.push(errorMessage);
-              log.push({
-                timestamp: new Date().toISOString(),
-                message: `❌ ${errorMessage}`,
-                success: false,
-                error: result.errors,
-              });
+              console.log(`✅ Saved mapping for menu: ${menu.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for menu ${menu.handle}:`,
+                mappingError.message,
+              );
             }
-          } else {
-            // Regular update failure
-            summary.failed++;
-            const errorMessage = `Failed to update menu "${menu.title}" (handle: ${menu.handle}): ${result.errors}`;
-            summary.errors.push(errorMessage);
-            log.push({
-              timestamp: new Date().toISOString(),
-              message: `❌ ${errorMessage}`,
-              success: false,
-              error: result.errors,
-            });
           }
+        } else {
+          // Update failure (already retried without handle inside updater when applicable)
+          summary.failed++;
+          const errorMessage = `Failed to update menu "${menu.title}" (handle: ${menu.handle}): ${result.errors}`;
+          summary.errors.push(errorMessage);
+          log.push({
+            timestamp: new Date().toISOString(),
+            message: `❌ ${errorMessage}`,
+            success: false,
+            error: result.errors,
+          });
         }
       } else {
         // Menu doesn't exist, create new one
@@ -712,13 +722,34 @@ export async function syncNavigationMenus(
         result = await createMenuInStaging(menu, stagingAdmin);
 
         if (result.success) {
-          menuId = result.menu.id;
           summary.created++;
           log.push({
             timestamp: new Date().toISOString(),
             message: `✅ Successfully created menu: ${menu.title}`,
             success: true,
           });
+
+          // Save mapping for created menu
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "navigation", {
+                productionId: extractIdFromGid(menu.id),
+                stagingId: extractIdFromGid(result.menu.id),
+                productionGid: menu.id,
+                stagingGid: result.menu.id,
+                matchKey: "handle",
+                matchValue: menu.handle,
+                syncId: null,
+                title: menu.title,
+              });
+              console.log(`✅ Saved mapping for menu: ${menu.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for menu ${menu.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
         } else {
           summary.failed++;
           const errorMessage = `Failed to create menu "${menu.title}" (handle: ${menu.handle}): ${result.errors}`;

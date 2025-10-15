@@ -168,3 +168,55 @@
 .list > li strong {
   color: #202223;
 }
+
+/* CLI Recommendation Banner */
+.cliRecommendation {
+  background: linear-gradient(135deg, #e6f3ff 0%, #f0f8ff 100%);
+  border: 2px solid #0064e0;
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  position: relative;
+  box-shadow: 0 2px 8px rgba(0, 100, 224, 0.1);
+}
+
+.cliRecommendationHeader {
+  font-size: 1.2rem;
+  color: #0064e0;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.cliRecommendationText {
+  margin: 0.75rem 0;
+  color: #3a3a3a;
+  line-height: 1.6;
+}
+
+.cliRecommendationText strong {
+  color: #0064e0;
+  font-weight: 600;
+}
+
+.cliRecommendationLink {
+  color: #0064e0;
+  font-weight: 600;
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  transition: border-bottom 0.2s ease;
+}
+
+.cliRecommendationLink:hover {
+  border-bottom: 2px solid #0064e0;
+}
+
+.cliRecommendationNote {
+  margin: 1rem 0 0 0;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(0, 100, 224, 0.2);
+  color: #5c5f62;
+  font-size: 0.95rem;
+  font-style: italic;
+}

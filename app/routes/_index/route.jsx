@@ -25,6 +25,35 @@ export default function App() {
           stores
         </p>
 
+        <div className={styles.cliRecommendation}>
+          <div className={styles.cliRecommendationHeader}>
+            <strong>🚀 New: Shopify CLI Store Copy Command</strong>
+          </div>
+          <p className={styles.cliRecommendationText}>
+            For syncing{" "}
+            <strong>
+              Products, Product Variants with inventory items, Product Files
+              (Images), Product Metafields, and Product Metafield Definitions
+            </strong>
+            , we recommend using Shopify's new CLI store copy command. It's the
+            best and simplest path for product data synchronization.
+          </p>
+          <p className={styles.cliRecommendationText}>
+            <a
+              href="https://shopify.dev/docs/beta/store-copy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={styles.cliRecommendationLink}
+            >
+              Learn more about the Store Copy command →
+            </a>
+          </p>
+          <p className={styles.cliRecommendationNote}>
+            Note: This app continues to support product sync, but the CLI
+            provides a more streamlined experience for product-related data.
+          </p>
+        </div>
+
         {showForm && (
           <Form className={styles.form} method="post" action="/auth/login">
             <label className={styles.label}>

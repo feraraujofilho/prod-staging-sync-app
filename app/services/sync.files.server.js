@@ -1,4 +1,5 @@
 import { json } from "@remix-run/node";
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 
 /**
  * Fetch all image files from production store
@@ -116,7 +117,8 @@ async function fileExistsInStaging(filename, stagingAdmin) {
   });
 
   const data = await response.json();
-  return data.data?.files?.edges?.length > 0;
+  const file = data.data?.files?.edges?.[0]?.node;
+  return file || false;
 }
 
 /**
@@ -278,6 +280,7 @@ export async function syncImageFiles(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
   onProgress = () => {},
 ) {
   const log = [];
@@ -338,15 +341,37 @@ export async function syncImageFiles(
       });
 
       // Check if file already exists
-      const exists = await fileExistsInStaging(filename, stagingAdmin);
+      const existingFile = await fileExistsInStaging(filename, stagingAdmin);
 
-      if (exists) {
+      if (existingFile) {
         summary.skipped++;
         log.push({
           timestamp: new Date().toISOString(),
           message: `⚠️ Skipped ${filename} - already exists in staging`,
           skipped: true,
         });
+
+        // Save mapping for existing file
+        if (storeConnectionId && existingFile.id) {
+          try {
+            await saveMapping(storeConnectionId, "file", {
+              productionId: extractIdFromGid(file.id),
+              stagingId: extractIdFromGid(existingFile.id),
+              productionGid: file.id,
+              stagingGid: existingFile.id,
+              matchKey: "filename",
+              matchValue: filename,
+              syncId: null,
+              title: filename,
+            });
+            console.log(`✅ Saved mapping for existing file: ${filename}`);
+          } catch (mappingError) {
+            console.error(
+              `⚠️ Failed to save mapping for existing file ${filename}:`,
+              mappingError.message,
+            );
+          }
+        }
         continue;
       }
 
@@ -367,6 +392,28 @@ export async function syncImageFiles(
             message: `✅ Successfully created: ${filename}`,
             success: true,
           });
+
+          // Save mapping for created file
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "file", {
+                productionId: extractIdFromGid(file.id),
+                stagingId: extractIdFromGid(result.file.id),
+                productionGid: file.id,
+                stagingGid: result.file.id,
+                matchKey: "filename",
+                matchValue: filename,
+                syncId: null,
+                title: filename,
+              });
+              console.log(`✅ Saved mapping for file: ${filename}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for file ${filename}:`,
+                mappingError.message,
+              );
+            }
+          }
         } else {
           summary.failed++;
           log.push({

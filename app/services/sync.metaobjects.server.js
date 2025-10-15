@@ -1,5 +1,7 @@
 // Service for syncing metaobject definitions between stores
 
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
+
 // Fetch metaobject definitions from a store
 async function getMetaobjectDefinitions(store, token) {
   const query = `
@@ -357,9 +359,9 @@ export async function syncMetaobjectDefinitions(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
 ) {
   const log = [];
-  console.log("CREDENTIALS", productionStore, accessToken);
 
   try {
     // Step 1: Fetch metaobject definitions from production
@@ -485,6 +487,28 @@ export async function syncMetaobjectDefinitions(
           message,
           success: true,
         });
+
+        // Save mapping for created metaobject definition
+        if (storeConnectionId) {
+          try {
+            await saveMapping(storeConnectionId, "metaobject", {
+              productionId: extractIdFromGid(definition.id),
+              stagingId: extractIdFromGid(result.definition.id),
+              productionGid: definition.id,
+              stagingGid: result.definition.id,
+              matchKey: "type",
+              matchValue: definition.type,
+              syncId: null,
+              title: definition.name || definition.type,
+            });
+            console.log(`✅ Saved mapping for metaobject: ${definition.type}`);
+          } catch (mappingError) {
+            console.error(
+              `⚠️ Failed to save mapping for metaobject ${definition.type}:`,
+              mappingError.message,
+            );
+          }
+        }
       } else {
         log.push({
           timestamp: new Date().toISOString(),

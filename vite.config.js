@@ -49,6 +49,10 @@ export default defineConfig({
       // See https://vitejs.dev/config/server-options.html#server-fs-allow for more information
       allow: ["app", "node_modules"],
     },
+    // Increase timeout and memory limits for long-running operations
+    timeout: 300000, // 5 minutes
+    keepAliveTimeout: 300000,
+    headersTimeout: 300000,
   },
   plugins: [
     remix({
@@ -66,8 +70,21 @@ export default defineConfig({
   ],
   build: {
     assetsInlineLimit: 0,
+    // Increase memory allocation for build process
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+          shopify: ["@shopify/app-bridge-react", "@shopify/polaris"],
+        },
+      },
+    },
   },
   optimizeDeps: {
     include: ["@shopify/app-bridge-react", "@shopify/polaris"],
+  },
+  // Increase memory limits
+  define: {
+    global: "globalThis",
   },
 });

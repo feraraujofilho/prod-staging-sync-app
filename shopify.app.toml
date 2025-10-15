@@ -3,30 +3,30 @@
 client_id = "8f5c558cd5afa2119088673e06cf3677"
 name = "app-staging"
 handle = "app-staging-3"
-application_url = "https://hazardous-citations-pty-vt.trycloudflare.com"
+application_url = "https://surround-neo-caution-conversion.trycloudflare.com"
 embedded = true
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true
+include_config_on_deploy = true
 
 [webhooks]
 api_version = "2025-07"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
-
-  [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,read_metaobject_definitions,write_metaobject_definitions,write_files,write_online_store_navigation,read_online_store_navigation,read_online_store_pages,write_online_store_pages,read_markets,write_markets,read_customers,read_companies,read_locales,write_locales,read_locations,write_locations"
+scopes = "read_companies,read_customers,read_locales,read_locations,read_markets,read_metaobject_definitions,read_online_store_navigation,read_online_store_pages,write_files,write_locales,write_locations,write_markets,write_metaobject_definitions,write_online_store_navigation,write_online_store_pages,write_products,write_publications"
 
 [auth]
-redirect_urls = ["https://hazardous-citations-pty-vt.trycloudflare.com/auth/callback", "https://hazardous-citations-pty-vt.trycloudflare.com/auth/shopify/callback", "https://hazardous-citations-pty-vt.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://surround-neo-caution-conversion.trycloudflare.com/auth/callback", "https://surround-neo-caution-conversion.trycloudflare.com/auth/shopify/callback", "https://surround-neo-caution-conversion.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false

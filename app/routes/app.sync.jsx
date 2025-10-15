@@ -1,9 +1,10 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   useLoaderData,
   useActionData,
   useNavigation,
   useSubmit,
+  useFetcher,
 } from "@remix-run/react";
 import {
   Page,
@@ -23,6 +24,8 @@ import {
   Icon,
   Box,
   Modal,
+  ProgressBar,
+  Checkbox,
 } from "@shopify/polaris";
 import {
   RefreshIcon,
@@ -76,6 +79,20 @@ export const loader = async ({ request }) => {
     },
   });
 
+  // Fetch currently running syncs so UI can display a banner even after refresh
+  const activeLogs = await prisma.syncLog.findMany({
+    where: { shop: session.shop, status: "in_progress" },
+    orderBy: { startedAt: "desc" },
+    take: 5,
+    select: {
+      id: true,
+      syncType: true,
+      status: true,
+      summary: true,
+      startedAt: true,
+    },
+  });
+
   // Get the most recently used connection ID for preselection
   const lastUsedConnection = await prisma.syncLog.findFirst({
     where: { shop: session.shop },
@@ -89,8 +106,68 @@ export const loader = async ({ request }) => {
     connections,
     recentLogs,
     lastUsedConnectionId: lastUsedConnection?.connectionId || "",
+    activeLogs,
   };
 };
+
+// Helper function to run sync with timeout
+async function runSyncWithTimeout(syncFunction, timeoutMs = 90000) {
+  return new Promise((resolve) => {
+    let timeoutId;
+    let completed = false;
+
+    // Set timeout
+    timeoutId = setTimeout(() => {
+      if (!completed) {
+        completed = true;
+        resolve({
+          success: false,
+          error:
+            "Sync operation timed out. The sync may still be running in the background. Please check the sync history for updates.",
+          timeout: true,
+          summary: {
+            total: 0,
+            created: 0,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            errors: [
+              "Operation timed out after " + timeoutMs / 1000 + " seconds",
+            ],
+          },
+        });
+      }
+    }, timeoutMs);
+
+    // Run the sync function
+    syncFunction()
+      .then((result) => {
+        if (!completed) {
+          completed = true;
+          clearTimeout(timeoutId);
+          resolve(result);
+        }
+      })
+      .catch((error) => {
+        if (!completed) {
+          completed = true;
+          clearTimeout(timeoutId);
+          resolve({
+            success: false,
+            error: error.message,
+            summary: {
+              total: 0,
+              created: 0,
+              updated: 0,
+              skipped: 0,
+              failed: 0,
+              errors: [error.message],
+            },
+          });
+        }
+      });
+  });
+}
 
 // Action handler for sync operations
 export const action = async ({ request }) => {
@@ -104,7 +181,7 @@ export const action = async ({ request }) => {
     return { error: "Please select a connection" };
   }
 
-  // Fetch connection with decrypted token
+  // Fetch connection with token
   const connection = await prisma.storeConnection.findUnique({
     where: { id: connectionId },
   });
@@ -113,8 +190,8 @@ export const action = async ({ request }) => {
     return { error: "Invalid connection" };
   }
 
-  const decryptedToken = connection.encryptedToken;
-  console.log("decryptedToken", decryptedToken);
+  const { decrypt } = await import("../utils/encryption.server");
+  const decryptedToken = decrypt(connection.encryptedToken);
   // Check if token decryption failed
   if (!decryptedToken) {
     return {
@@ -139,75 +216,190 @@ export const action = async ({ request }) => {
 
     switch (syncType) {
       case "metafield_definitions":
-        result = await syncMetafieldDefinitions(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
-          ["PRODUCT", "PRODUCTVARIANT"], // Sync both product and variant metafield definitions
+        // Sync all metafield definitions EXCEPT product and variant (those are handled in product sync)
+        const metafieldTypes = [
+          "COLLECTION",
+          "CUSTOMER",
+          "ORDER",
+          "DRAFTORDER",
+          "PAGE",
+          "SHOP",
+          "ARTICLE",
+          "BLOG",
+          "COMPANY",
+          "COMPANYLOCATION",
+          "LOCATION",
+          "MARKET",
+        ];
+        result = await runSyncWithTimeout(() =>
+          syncMetafieldDefinitions(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            metafieldTypes,
+          ),
         );
         break;
 
       case "metaobject_definitions":
-        result = await syncMetaobjectDefinitions(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
+        result = await runSyncWithTimeout(() =>
+          syncMetaobjectDefinitions(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
         );
         break;
 
-      case "products":
-        result = await syncProducts(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
-        );
-        break;
+      case "products": {
+        // Kick off a background sync and return immediately with the log id
+        // so the UI can poll progress. This avoids Cloudflare 524 timeouts.
+        (async () => {
+          try {
+            const onProgress = async (progress) => {
+              try {
+                // Persist progress stage/percentage so UI can show a live bar
+                await prisma.syncLog.update({
+                  where: { id: syncLog.id },
+                  data: {
+                    summary: JSON.stringify({
+                      progress: {
+                        percentage: progress.percentage ?? 0,
+                        stage: progress.stage ?? "running",
+                        message: progress.message ?? "",
+                      },
+                    }),
+                  },
+                });
+              } catch (e) {
+                console.error("Failed to update sync progress:", e);
+              }
+            };
+
+            const bgResult = await syncProducts(
+              connection.storeDomain,
+              decryptedToken,
+              admin,
+              connection.id,
+              onProgress,
+            );
+
+            const hasErrors =
+              bgResult.summary?.errors && bgResult.summary.errors.length > 0;
+            const hasSuccess =
+              bgResult.summary?.created > 0 || bgResult.summary?.updated > 0;
+
+            let status = "failed";
+            if (hasSuccess && hasErrors) {
+              status = "partially_successful";
+            } else if (
+              hasSuccess ||
+              (!hasErrors &&
+                (bgResult.summary?.total > 0 || bgResult.summary?.skipped > 0))
+            ) {
+              status = "success";
+            }
+
+            const logsToSave = bgResult.logs || bgResult.log || [];
+
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status,
+                summary: JSON.stringify(bgResult.summary || {}),
+                logs: JSON.stringify(logsToSave),
+                completedAt: new Date(),
+              },
+            });
+          } catch (err) {
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status: "failed",
+                summary: JSON.stringify({ error: err.message }),
+                completedAt: new Date(),
+              },
+            });
+          }
+        })();
+
+        // Return quickly; UI will poll /app/sync/status?logId=...
+        return {
+          started: true,
+          logId: syncLog.id,
+          message:
+            "Product sync started and is running in the background. You can close this window.",
+        };
+      }
 
       case "collections":
-        result = await syncCollections(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
+        result = await runSyncWithTimeout(() =>
+          syncCollections(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
         );
         break;
 
       case "files":
-        result = await syncImageFiles(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
+        result = await runSyncWithTimeout(() =>
+          syncImageFiles(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
         );
         break;
 
       case "navigation":
-        result = await syncNavigationMenus(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
+        result = await runSyncWithTimeout(() =>
+          syncNavigationMenus(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
         );
         break;
 
       case "pages":
-        result = await syncPages(connection.storeDomain, decryptedToken, admin);
+        result = await runSyncWithTimeout(() =>
+          syncPages(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
+        );
         break;
 
       case "markets":
-        result = await syncMarkets(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
+        result = await runSyncWithTimeout(() =>
+          syncMarkets(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+          ),
         );
         break;
 
       case "locations":
-        result = await syncLocations(
-          connection.storeDomain,
-          decryptedToken,
-          admin,
-          (progress) => {
-            // Progress callback for locations sync
-            console.log("Location sync progress:", progress);
-          },
+        result = await runSyncWithTimeout(() =>
+          syncLocations(
+            connection.storeDomain,
+            decryptedToken,
+            admin,
+            connection.id,
+            (progress) => {
+              // Progress callback for locations sync
+              console.log("Location sync progress:", progress);
+            },
+          ),
         );
         break;
 
@@ -283,13 +475,6 @@ export const action = async ({ request }) => {
 // Sync type configurations
 const SYNC_TYPES = [
   {
-    id: "metafield_definitions",
-    label: "Metafield Definitions",
-    description: "Sync product and variant metafield structures between stores",
-    icon: SettingsIcon,
-    available: true,
-  },
-  {
     id: "metaobject_definitions",
     label: "Metaobject Definitions",
     description: "Sync metaobject definitions between stores",
@@ -335,24 +520,37 @@ const SYNC_TYPES = [
   {
     id: "products",
     label: "Products",
-    description: "Sync product catalog including variants and images",
+    description:
+      "Sync product catalog including variants, images, and metafields",
     icon: ProductIcon,
     available: true,
+    // cliRecommended: true,
   },
+  /* {
+    id: "metafield_definitions",
+    label: "Metafield Definitions",
+    description:
+      "Sync metafield structures between stores (excludes product/variant metafields - use Product sync for those)",
+    icon: SettingsIcon,
+    available: false,
+  }, */
   {
     id: "collections",
     label: "Collections",
-    description: "Sync collections and their product associations",
+    description:
+      "Sync collections and their product associations (run the product sync previously)",
     icon: CollectionIcon,
     available: true,
   },
 ];
 
 export default function DataSync() {
-  const { connections, recentLogs, lastUsedConnectionId } = useLoaderData();
+  const { connections, recentLogs, lastUsedConnectionId, activeLogs } =
+    useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const submit = useSubmit();
+  const statusFetcher = useFetcher();
 
   const [selectedTab, setSelectedTab] = useState(0);
   const [selectedConnection, setSelectedConnection] =
@@ -360,8 +558,17 @@ export default function DataSync() {
   const [showLogs, setShowLogs] = useState(false);
   const [selectedLogId, setSelectedLogId] = useState(null);
   const [selectedLogDetails, setSelectedLogDetails] = useState(null);
+  const [selectedSyncTypes, setSelectedSyncTypes] = useState([]);
+  const [currentSyncIndex, setCurrentSyncIndex] = useState(0);
+  const [syncProgress, setSyncProgress] = useState(null);
+  const [isRunningBulkSync, setIsRunningBulkSync] = useState(false);
+  const [activeLogId, setActiveLogId] = useState(null);
+  const [backgroundStatus, setBackgroundStatus] = useState(null);
 
   const isLoading = navigation.state === "submitting";
+
+  // Track previous navigation state for better sync detection
+  const prevNavigationStateRef = useRef(navigation.state);
 
   // Auto-show logs when sync completes
   useEffect(() => {
@@ -369,6 +576,140 @@ export default function DataSync() {
       setShowLogs(true);
     }
   }, [actionData]);
+
+  // When a background job is started by the action, begin polling status
+  useEffect(() => {
+    if (actionData?.started && actionData?.logId) {
+      setActiveLogId(actionData.logId);
+      setBackgroundStatus({ status: "in_progress" });
+      // kick off an immediate load
+      statusFetcher.load(`/app/sync/status?logId=${actionData.logId}`);
+    }
+  }, [actionData, statusFetcher]);
+
+  // On initial page load, if there is an active sync from the loader, start polling it
+  useEffect(() => {
+    if (!activeLogId && Array.isArray(activeLogs) && activeLogs.length > 0) {
+      const log = activeLogs[0];
+      let initialSummary = null;
+      try {
+        initialSummary = log.summary ? JSON.parse(log.summary) : null;
+      } catch {
+        initialSummary = { message: log.summary };
+      }
+      setActiveLogId(log.id);
+      setBackgroundStatus({
+        status: log.status,
+        summary: initialSummary,
+        startedAt: log.startedAt,
+      });
+      statusFetcher.load(`/app/sync/status?logId=${log.id}`);
+    }
+  }, [activeLogs, activeLogId, statusFetcher]);
+
+  // Poll every 3s while activeLogId is set and until completed
+  useEffect(() => {
+    if (!activeLogId) return;
+    const interval = setInterval(() => {
+      statusFetcher.load(`/app/sync/status?logId=${activeLogId}`);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [activeLogId, statusFetcher]);
+
+  // Track fetcher data for background progress/completion
+  useEffect(() => {
+    if (statusFetcher.data) {
+      setBackgroundStatus(statusFetcher.data);
+      if (statusFetcher.data.completedAt) {
+        // Show logs when job completes via polling
+        setShowLogs(true);
+      }
+    }
+  }, [statusFetcher.data]);
+
+  // Handle bulk sync progress
+  useEffect(() => {
+    const prevState = prevNavigationStateRef.current;
+    const currentState = navigation.state;
+
+    console.log("Bulk sync state check:", {
+      isRunningBulkSync,
+      prevNavigationState: prevState,
+      currentNavigationState: currentState,
+      currentSyncIndex,
+      totalSyncs: selectedSyncTypes.length,
+      hasActionData: !!actionData,
+    });
+
+    // Detect when a sync has just completed (transition from submitting/loading to idle)
+    const justCompleted =
+      prevState !== "idle" && currentState === "idle" && isRunningBulkSync;
+
+    // Update previous state ref
+    prevNavigationStateRef.current = currentState;
+
+    if (justCompleted) {
+      console.log(
+        `Sync completed. Current index: ${currentSyncIndex}, Total: ${selectedSyncTypes.length}`,
+      );
+
+      // Check if we have more syncs to run
+      if (currentSyncIndex < selectedSyncTypes.length - 1) {
+        // Move to next sync
+        const nextIndex = currentSyncIndex + 1;
+        const nextSyncType = selectedSyncTypes[nextIndex];
+
+        console.log(
+          `Moving to next sync: ${nextSyncType} (${nextIndex + 1}/${selectedSyncTypes.length})`,
+        );
+
+        // Update state for next sync
+        setCurrentSyncIndex(nextIndex);
+        setSyncProgress({
+          current: nextIndex,
+          total: selectedSyncTypes.length,
+          currentSync: nextSyncType,
+          percentage: Math.round((nextIndex / selectedSyncTypes.length) * 100),
+        });
+
+        // Submit next sync with a small delay to ensure state updates
+        setTimeout(() => {
+          console.log(`Submitting next sync: ${nextSyncType}`);
+          const formData = new FormData();
+          formData.append("syncType", nextSyncType);
+          formData.append("connectionId", selectedConnection);
+          formData.append("isBulkSync", "true");
+          submit(formData, { method: "post" });
+        }, 1000); // Increased delay for more reliable execution
+      } else {
+        // All syncs complete
+        console.log("All bulk syncs complete!");
+        setSyncProgress({
+          current: selectedSyncTypes.length,
+          total: selectedSyncTypes.length,
+          currentSync: selectedSyncTypes[selectedSyncTypes.length - 1],
+          percentage: 100,
+          complete: true,
+        });
+
+        // Clear state after showing completion
+        setTimeout(() => {
+          setIsRunningBulkSync(false);
+          setSyncProgress(null);
+          setCurrentSyncIndex(0);
+          setSelectedSyncTypes([]);
+        }, 3000);
+      }
+    }
+  }, [
+    navigation.state,
+    isRunningBulkSync,
+    currentSyncIndex,
+    selectedSyncTypes,
+    selectedConnection,
+    submit,
+    actionData,
+  ]);
 
   const handleTabChange = useCallback(
     (selectedTabIndex) => setSelectedTab(selectedTabIndex),
@@ -388,6 +729,55 @@ export default function DataSync() {
     },
     [selectedConnection, submit],
   );
+
+  const handleSyncTypeToggle = useCallback((syncTypeId) => {
+    setSelectedSyncTypes((prev) => {
+      if (prev.includes(syncTypeId)) {
+        return prev.filter((id) => id !== syncTypeId);
+      } else {
+        return [...prev, syncTypeId];
+      }
+    });
+  }, []);
+
+  const handleSelectAll = useCallback(() => {
+    const availableSyncTypes = SYNC_TYPES.filter((type) => type.available).map(
+      (type) => type.id,
+    );
+    setSelectedSyncTypes(availableSyncTypes);
+  }, []);
+
+  const handleDeselectAll = useCallback(() => {
+    setSelectedSyncTypes([]);
+  }, []);
+
+  const handleBulkSync = useCallback(() => {
+    if (!selectedConnection || selectedSyncTypes.length === 0) {
+      return;
+    }
+
+    console.log(
+      `Starting bulk sync with ${selectedSyncTypes.length} types:`,
+      selectedSyncTypes,
+    );
+
+    setIsRunningBulkSync(true);
+    setCurrentSyncIndex(0);
+    setSyncProgress({
+      current: 0,
+      total: selectedSyncTypes.length,
+      currentSync: selectedSyncTypes[0],
+      percentage: 0,
+    });
+
+    // Start first sync
+    console.log(`Starting first sync: ${selectedSyncTypes[0]}`);
+    const formData = new FormData();
+    formData.append("syncType", selectedSyncTypes[0]);
+    formData.append("connectionId", selectedConnection);
+    formData.append("isBulkSync", "true");
+    submit(formData, { method: "post" });
+  }, [selectedConnection, selectedSyncTypes, submit]);
 
   const handleViewLog = useCallback((log) => {
     // Parse the logs and summary from JSON
@@ -472,17 +862,87 @@ export default function DataSync() {
       }
     >
       <Layout>
+        {/* Background running banner/progress (products) */}
+        {activeLogId && backgroundStatus?.status === "in_progress" && (
+          <Layout.Section>
+            <Banner
+              status="info"
+              title="Product sync is running in the background"
+            >
+              <BlockStack gap="200">
+                <Text variant="bodyMd">
+                  You can safely close this window; the sync continues in the
+                  background. Check the Sync History tab for updates.
+                </Text>
+                <ProgressBar
+                  progress={
+                    backgroundStatus?.summary?.progress?.percentage ??
+                    backgroundStatus?.summary?.percentage ??
+                    0
+                  }
+                  size="small"
+                />
+                {backgroundStatus?.summary?.progress?.stage && (
+                  <Text variant="bodySm" color="subdued">
+                    Stage: {backgroundStatus.summary.progress.stage}
+                  </Text>
+                )}
+              </BlockStack>
+            </Banner>
+          </Layout.Section>
+        )}
         {actionData?.error && (
           <Layout.Section>
-            <Banner status="critical">{actionData.error}</Banner>
+            <Banner
+              status={actionData.timeout ? "warning" : "critical"}
+              title={
+                actionData.timeout ? "Sync operation timed out" : "Sync error"
+              }
+            >
+              <BlockStack gap="200">
+                <Text variant="bodyMd">{actionData.error}</Text>
+                {actionData.timeout && (
+                  <Text variant="bodyMd" color="subdued">
+                    Large sync operations may take more time than the browser
+                    allows. The sync might still be running in the background.
+                    Please refresh the page and check the sync history for
+                    updates.
+                  </Text>
+                )}
+              </BlockStack>
+            </Banner>
           </Layout.Section>
         )}
 
         {actionData?.success && (
           <Layout.Section>
             <Banner
-              status="success"
-              title="Sync completed successfully"
+              status={(() => {
+                try {
+                  const summaryData =
+                    typeof actionData.summary === "string"
+                      ? JSON.parse(actionData.summary)
+                      : actionData.summary;
+                  return summaryData?.errors?.length > 0
+                    ? "warning"
+                    : "success";
+                } catch {
+                  return "success";
+                }
+              })()}
+              title={(() => {
+                try {
+                  const summaryData =
+                    typeof actionData.summary === "string"
+                      ? JSON.parse(actionData.summary)
+                      : actionData.summary;
+                  return summaryData?.errors?.length > 0
+                    ? "Sync completed with warnings"
+                    : "Sync completed successfully";
+                } catch {
+                  return "Sync completed successfully";
+                }
+              })()}
               onDismiss={() => {}}
             >
               {actionData.summary && (
@@ -507,16 +967,62 @@ export default function DataSync() {
                         "updateFailed",
                       ];
 
-                      return Object.entries(summaryData)
+                      const summaryElements = [];
+
+                      // Add numeric summary values
+                      Object.entries(summaryData)
                         .filter(([key]) => relevantKeys.includes(key))
-                        .map(([key, value]) => (
-                          <Text key={key} variant="bodyMd">
-                            {key
-                              .replace(/_/g, " ")
-                              .replace(/\b\w/g, (l) => l.toUpperCase())}
-                            : {value}
-                          </Text>
-                        ));
+                        .forEach(([key, value]) => {
+                          summaryElements.push(
+                            <Text key={key} variant="bodyMd">
+                              {key
+                                .replace(/_/g, " ")
+                                .replace(/\b\w/g, (l) => l.toUpperCase())}
+                              : {value}
+                            </Text>,
+                          );
+                        });
+
+                      // Handle errors array if present
+                      if (
+                        summaryData.errors &&
+                        Array.isArray(summaryData.errors) &&
+                        summaryData.errors.length > 0
+                      ) {
+                        summaryElements.push(
+                          <Box
+                            key="errors"
+                            padding="200"
+                            background="bg-warning-subdued"
+                            borderRadius="200"
+                          >
+                            <BlockStack gap="100">
+                              <Text variant="bodyMd" fontWeight="semibold">
+                                Errors encountered:
+                              </Text>
+                              {summaryData.errors
+                                .slice(0, 5)
+                                .map((error, index) => (
+                                  <Text
+                                    key={`error-${index}`}
+                                    variant="bodySm"
+                                    color="warning"
+                                  >
+                                    • {error}
+                                  </Text>
+                                ))}
+                              {summaryData.errors.length > 5 && (
+                                <Text variant="bodySm" color="subdued">
+                                  ... and {summaryData.errors.length - 5} more
+                                  errors
+                                </Text>
+                              )}
+                            </BlockStack>
+                          </Box>,
+                        );
+                      }
+
+                      return summaryElements;
                     } catch (error) {
                       console.error("Error parsing summary:", error);
                       return (
@@ -563,6 +1069,7 @@ export default function DataSync() {
                     value={selectedConnection}
                     onChange={setSelectedConnection}
                     helpText="Choose which store to sync data from"
+                    disabled={isRunningBulkSync}
                   />
                 </BlockStack>
               </Card>
@@ -579,9 +1086,131 @@ export default function DataSync() {
                     <>
                       <Card>
                         <BlockStack gap="400">
-                          <Text variant="headingMd" as="h2">
-                            Available Sync Operations
-                          </Text>
+                          <InlineStack align="space-between">
+                            <Text variant="headingMd" as="h2">
+                              Available Sync Operations
+                            </Text>
+                            <InlineStack gap="200">
+                              <Button
+                                onClick={handleSelectAll}
+                                plain
+                                disabled={isRunningBulkSync}
+                              >
+                                Select All
+                              </Button>
+                              <Button
+                                onClick={handleDeselectAll}
+                                plain
+                                disabled={isRunningBulkSync}
+                              >
+                                Deselect All
+                              </Button>
+                              <Button
+                                primary
+                                disabled={
+                                  selectedSyncTypes.length === 0 ||
+                                  !selectedConnection ||
+                                  isRunningBulkSync
+                                }
+                                onClick={handleBulkSync}
+                              >
+                                Run {selectedSyncTypes.length} Selected Sync
+                                {selectedSyncTypes.length !== 1 ? "s" : ""}
+                              </Button>
+                            </InlineStack>
+                          </InlineStack>
+
+                          {!selectedConnection && (
+                            <Banner status="warning">
+                              Please select a source connection above before
+                              running any sync operations.
+                            </Banner>
+                          )}
+
+                          {/* <Banner
+                            status="info"
+                            title="Recommended: Shopify CLI Store Copy"
+                          >
+                            <BlockStack gap="200">
+                              <Text variant="bodyMd">
+                                For syncing{" "}
+                                <strong>
+                                  Products, Product Variants with inventory
+                                  items, Product Files (Images), Product
+                                  Metafields, and Product Metafield Definitions
+                                </strong>
+                                , we recommend using Shopify's new CLI store
+                                copy command.
+                              </Text>
+                              <Text variant="bodyMd">
+                                The CLI provides the best and simplest path for
+                                product data synchronization.
+                              </Text>
+                              <Text variant="bodyMd">
+                                <a
+                                  href="https://shopify.dev/docs/beta/store-copy"
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  style={{
+                                    color: "#0064e0",
+                                    fontWeight: "600",
+                                    textDecoration: "underline",
+                                  }}
+                                >
+                                  Learn more about the Store Copy command →
+                                </a>
+                              </Text>
+                            </BlockStack>
+                          </Banner> */}
+
+                          {/* <Banner
+                            status="warning"
+                            title="Note about large sync operations"
+                          >
+                            <Text variant="bodyMd">
+                              Large sync operations (especially for Products
+                              with many items) may take longer than 90 seconds.
+                              If a sync times out, it might still be running in
+                              the background. Check the Sync History tab for
+                              updates on the operation status.
+                            </Text>
+                          </Banner> */}
+
+                          {syncProgress && (
+                            <Box
+                              padding="400"
+                              background="bg-surface-secondary"
+                              borderRadius="200"
+                            >
+                              <BlockStack gap="200">
+                                <InlineStack align="space-between">
+                                  <Text variant="headingSm">
+                                    {syncProgress.complete
+                                      ? "Bulk Sync Complete!"
+                                      : "Bulk Sync Progress"}
+                                  </Text>
+                                  <Text variant="bodySm" color="subdued">
+                                    {syncProgress.current} of{" "}
+                                    {syncProgress.total} complete
+                                  </Text>
+                                </InlineStack>
+                                <ProgressBar
+                                  progress={syncProgress.percentage}
+                                  size="small"
+                                  tone={
+                                    syncProgress.complete
+                                      ? "success"
+                                      : "primary"
+                                  }
+                                />
+                                <Text variant="bodySm" color="subdued">
+                                  {syncProgress.complete
+                                    ? "All selected syncs have been completed successfully!"
+                                    : `Currently syncing: ${SYNC_TYPES.find((t) => t.id === syncProgress.currentSync)?.label || syncProgress.currentSync}`}
+                                </Text>
+                              </BlockStack>
+                            </Box>
+                          )}
 
                           <BlockStack gap="300">
                             <Box
@@ -612,9 +1241,11 @@ export default function DataSync() {
                                 padding="400"
                                 borderRadius="200"
                                 background={
-                                  syncType.available
-                                    ? "bg-surface"
-                                    : "bg-surface-disabled"
+                                  !syncType.available
+                                    ? "bg-surface-disabled"
+                                    : selectedSyncTypes.includes(syncType.id)
+                                      ? "bg-surface-selected"
+                                      : "bg-surface"
                                 }
                               >
                                 <InlineStack
@@ -623,6 +1254,17 @@ export default function DataSync() {
                                   blockAlign="center"
                                 >
                                   <InlineStack gap="400" blockAlign="center">
+                                    <Checkbox
+                                      checked={selectedSyncTypes.includes(
+                                        syncType.id,
+                                      )}
+                                      onChange={() =>
+                                        handleSyncTypeToggle(syncType.id)
+                                      }
+                                      disabled={
+                                        !syncType.available || isRunningBulkSync
+                                      }
+                                    />
                                     <Icon
                                       source={syncType.icon}
                                       color={
@@ -647,7 +1289,8 @@ export default function DataSync() {
                                     disabled={
                                       !syncType.available ||
                                       !selectedConnection ||
-                                      isLoading
+                                      isLoading ||
+                                      isRunningBulkSync
                                     }
                                     loading={
                                       isLoading &&
@@ -666,6 +1309,36 @@ export default function DataSync() {
                                     )}
                                   </Button>
                                 </InlineStack>
+                                {syncType.cliRecommended && (
+                                  <div style={{ marginTop: "0.75rem" }}>
+                                    <Box
+                                      padding="300"
+                                      borderRadius="100"
+                                      background="bg-info-subdued"
+                                    >
+                                      <InlineStack
+                                        gap="200"
+                                        blockAlign="center"
+                                      >
+                                        <Text variant="bodySm" color="info">
+                                          💡 <strong>Recommended:</strong> Use{" "}
+                                          <a
+                                            href="https://shopify.dev/docs/beta/store-copy"
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            style={{
+                                              color: "inherit",
+                                              textDecoration: "underline",
+                                            }}
+                                          >
+                                            Shopify CLI store copy
+                                          </a>{" "}
+                                          for the best product sync experience
+                                        </Text>
+                                      </InlineStack>
+                                    </Box>
+                                  </div>
+                                )}
                               </Box>
                             ))}
                           </BlockStack>
@@ -749,6 +1422,7 @@ export default function DataSync() {
                                   .replace(/\b\w/g, (l) => l.toUpperCase()),
                                 log.connection.name,
                                 <Badge
+                                  key={`status-${log.id}`}
                                   status={
                                     log.status === "success"
                                       ? "success"
@@ -763,10 +1437,16 @@ export default function DataSync() {
                                     ? "partially successful"
                                     : log.status}
                                 </Badge>,
-                                <Text variant="bodySm">{summaryText}</Text>,
+                                <Text
+                                  key={`summary-${log.id}`}
+                                  variant="bodySm"
+                                >
+                                  {summaryText}
+                                </Text>,
                                 new Date(log.startedAt).toLocaleString(),
                                 duration ? `${duration}s` : "In progress",
                                 <Button
+                                  key={`view-${log.id}`}
                                   plain
                                   onClick={() => {
                                     handleViewLog(log);
@@ -785,45 +1465,52 @@ export default function DataSync() {
               </Tabs>
             </Layout.Section>
 
-            {actionData?.logs && showLogs && (
-              <Layout.Section>
-                <Card>
-                  <BlockStack gap="400">
-                    <InlineStack align="space-between">
-                      <Text variant="headingMd" as="h2">
-                        Sync Logs
-                      </Text>
-                      <Button plain onClick={() => setShowLogs(false)}>
-                        Hide Logs
-                      </Button>
-                    </InlineStack>
+            {(actionData?.logs ||
+              (backgroundStatus?.completedAt && backgroundStatus?.logs)) &&
+              showLogs && (
+                <Layout.Section>
+                  <Card>
+                    <BlockStack gap="400">
+                      <InlineStack align="space-between">
+                        <Text variant="headingMd" as="h2">
+                          Sync Logs
+                        </Text>
+                        <Button plain onClick={() => setShowLogs(false)}>
+                          Hide Logs
+                        </Button>
+                      </InlineStack>
 
-                    <Scrollable style={{ height: "400px" }}>
-                      <BlockStack gap="100">
-                        {actionData.logs.map((log, index) => (
-                          <Box key={index} padding="200">
-                            <Text
-                              variant="bodySm"
-                              color={
-                                log.error || log.message?.includes("❌")
-                                  ? "critical"
-                                  : log.success || log.message?.includes("✅")
-                                    ? "success"
-                                    : log.skipped || log.message?.includes("⚠️")
-                                      ? "caution"
-                                      : "subdued"
-                              }
-                            >
-                              [{log.timestamp}] {log.message}
-                            </Text>
-                          </Box>
-                        ))}
-                      </BlockStack>
-                    </Scrollable>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-            )}
+                      <Scrollable style={{ height: "400px" }}>
+                        <BlockStack gap="100">
+                          {(
+                            actionData?.logs ||
+                            backgroundStatus?.logs ||
+                            []
+                          ).map((log, index) => (
+                            <Box key={index} padding="200">
+                              <Text
+                                variant="bodySm"
+                                color={
+                                  log.error || log.message?.includes("❌")
+                                    ? "critical"
+                                    : log.success || log.message?.includes("✅")
+                                      ? "success"
+                                      : log.skipped ||
+                                          log.message?.includes("⚠️")
+                                        ? "caution"
+                                        : "subdued"
+                                }
+                              >
+                                [{log.timestamp}] {log.message}
+                              </Text>
+                            </Box>
+                          ))}
+                        </BlockStack>
+                      </Scrollable>
+                    </BlockStack>
+                  </Card>
+                </Layout.Section>
+              )}
           </>
         )}
       </Layout>

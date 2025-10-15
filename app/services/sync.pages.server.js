@@ -3,6 +3,8 @@
  * Syncs pages from production to staging store
  */
 
+import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
+
 /**
  * Fetch all pages from production store
  * @param {string} productionStore - The production store domain
@@ -262,6 +264,7 @@ export async function syncPages(
   productionStore,
   accessToken,
   stagingAdmin,
+  storeConnectionId = null,
   onProgress = () => {},
 ) {
   const log = [];
@@ -338,6 +341,28 @@ export async function syncPages(
             timestamp: new Date().toISOString(),
             message: `✅ Successfully updated page: ${page.title}`,
           });
+
+          // Save mapping for updated page
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "page", {
+                productionId: extractIdFromGid(page.id),
+                stagingId: extractIdFromGid(existingPage.id),
+                productionGid: page.id,
+                stagingGid: existingPage.id,
+                matchKey: "handle",
+                matchValue: page.handle,
+                syncId: null,
+                title: page.title,
+              });
+              console.log(`✅ Saved mapping for page: ${page.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for page ${page.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
         } else {
           summary.failed++;
           log.push({
@@ -365,6 +390,28 @@ export async function syncPages(
             timestamp: new Date().toISOString(),
             message: `✅ Successfully created page: ${page.title}`,
           });
+
+          // Save mapping for created page
+          if (storeConnectionId) {
+            try {
+              await saveMapping(storeConnectionId, "page", {
+                productionId: extractIdFromGid(page.id),
+                stagingId: extractIdFromGid(result.page.id),
+                productionGid: page.id,
+                stagingGid: result.page.id,
+                matchKey: "handle",
+                matchValue: page.handle,
+                syncId: null,
+                title: page.title,
+              });
+              console.log(`✅ Saved mapping for page: ${page.handle}`);
+            } catch (mappingError) {
+              console.error(
+                `⚠️ Failed to save mapping for page ${page.handle}:`,
+                mappingError.message,
+              );
+            }
+          }
         } else {
           summary.failed++;
           log.push({
