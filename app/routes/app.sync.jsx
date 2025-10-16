@@ -47,6 +47,7 @@ import { syncMarkets } from "../services/sync.markets.server";
 import { syncProducts } from "../services/sync.products.server";
 import { syncCollections } from "../services/sync.collections.server";
 import { syncLocations } from "../services/sync.locations.server";
+import { syncSearchDiscoveryMetafields } from "../services/sync.search-discovery.server";
 
 // Loader to fetch connections and recent sync logs
 export const loader = async ({ request }) => {
@@ -333,27 +334,160 @@ export const action = async ({ request }) => {
         };
       }
 
-      case "collections":
-        result = await runSyncWithTimeout(() =>
-          syncCollections(
-            connection.storeDomain,
-            decryptedToken,
-            admin,
-            connection.id,
-          ),
-        );
-        break;
+      case "collections": {
+        // Run collections sync in background to avoid timeouts
+        (async () => {
+          try {
+            const onProgress = async (progress) => {
+              try {
+                await prisma.syncLog.update({
+                  where: { id: syncLog.id },
+                  data: {
+                    summary: JSON.stringify({
+                      progress: {
+                        percentage: progress.percentage ?? 0,
+                        stage: progress.stage ?? "running",
+                        message: progress.message ?? "",
+                      },
+                    }),
+                  },
+                });
+              } catch (e) {
+                console.error("Failed to update sync progress:", e);
+              }
+            };
 
-      case "files":
-        result = await runSyncWithTimeout(() =>
-          syncImageFiles(
-            connection.storeDomain,
-            decryptedToken,
-            admin,
-            connection.id,
-          ),
-        );
-        break;
+            const bgResult = await syncCollections(
+              connection.storeDomain,
+              decryptedToken,
+              admin,
+              connection.id,
+              onProgress,
+            );
+
+            const hasErrors =
+              bgResult.summary?.errors && bgResult.summary.errors.length > 0;
+            const hasSuccess =
+              bgResult.summary?.created > 0 || bgResult.summary?.updated > 0;
+
+            let status = "failed";
+            if (hasSuccess && hasErrors) {
+              status = "partially_successful";
+            } else if (
+              hasSuccess ||
+              (!hasErrors &&
+                (bgResult.summary?.total > 0 || bgResult.summary?.skipped > 0))
+            ) {
+              status = "success";
+            }
+
+            const logsToSave = bgResult.logs || bgResult.log || [];
+
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status,
+                summary: JSON.stringify(bgResult.summary || {}),
+                logs: JSON.stringify(logsToSave),
+                completedAt: new Date(),
+              },
+            });
+          } catch (err) {
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status: "failed",
+                summary: JSON.stringify({ error: err.message }),
+                completedAt: new Date(),
+              },
+            });
+          }
+        })();
+
+        return {
+          started: true,
+          logId: syncLog.id,
+          message:
+            "Collections sync started and is running in the background. You can close this window.",
+        };
+      }
+
+      case "files": {
+        // Run files sync in background to avoid timeouts with high volume
+        (async () => {
+          try {
+            const onProgress = async (progress) => {
+              try {
+                await prisma.syncLog.update({
+                  where: { id: syncLog.id },
+                  data: {
+                    summary: JSON.stringify({
+                      progress: {
+                        percentage: progress.percentage ?? 0,
+                        stage: progress.stage ?? "running",
+                        message: progress.message ?? "",
+                      },
+                    }),
+                  },
+                });
+              } catch (e) {
+                console.error("Failed to update sync progress:", e);
+              }
+            };
+
+            const bgResult = await syncImageFiles(
+              connection.storeDomain,
+              decryptedToken,
+              admin,
+              connection.id,
+              onProgress,
+            );
+
+            const hasErrors =
+              bgResult.summary?.errors && bgResult.summary.errors.length > 0;
+            const hasSuccess = bgResult.summary?.created > 0;
+
+            let status = "failed";
+            if (hasSuccess && hasErrors) {
+              status = "partially_successful";
+            } else if (
+              hasSuccess ||
+              (!hasErrors &&
+                (bgResult.summary?.total > 0 || bgResult.summary?.skipped > 0))
+            ) {
+              status = "success";
+            }
+
+            const logsToSave = bgResult.logs || bgResult.log || [];
+
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status,
+                summary: JSON.stringify(bgResult.summary || {}),
+                logs: JSON.stringify(logsToSave),
+                completedAt: new Date(),
+              },
+            });
+          } catch (err) {
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status: "failed",
+                summary: JSON.stringify({ error: err.message }),
+                completedAt: new Date(),
+              },
+            });
+          }
+        })();
+
+        return {
+          started: true,
+          logId: syncLog.id,
+          message:
+            "Files sync started and is running in the background. You can close this window.",
+        };
+      }
 
       case "navigation":
         result = await runSyncWithTimeout(() =>
@@ -402,6 +536,83 @@ export const action = async ({ request }) => {
           ),
         );
         break;
+
+      case "search_discovery": {
+        // Run search & discovery sync in background to avoid timeouts
+        (async () => {
+          try {
+            const onProgress = async (progress) => {
+              try {
+                await prisma.syncLog.update({
+                  where: { id: syncLog.id },
+                  data: {
+                    summary: JSON.stringify({
+                      progress: {
+                        percentage: progress.percentage ?? 0,
+                        stage: progress.stage ?? "running",
+                        message: progress.message ?? "",
+                      },
+                    }),
+                  },
+                });
+              } catch (e) {
+                console.error("Failed to update sync progress:", e);
+              }
+            };
+
+            const bgResult = await syncSearchDiscoveryMetafields(
+              connection.storeDomain,
+              decryptedToken,
+              admin,
+              connection.id,
+              onProgress,
+            );
+
+            const hasErrors =
+              bgResult.summary?.errors && bgResult.summary.errors.length > 0;
+            const hasSuccess = bgResult.summary?.updated > 0;
+
+            let status = "failed";
+            if (hasSuccess && hasErrors) {
+              status = "partially_successful";
+            } else if (
+              hasSuccess ||
+              (!hasErrors &&
+                (bgResult.summary?.total > 0 || bgResult.summary?.skipped > 0))
+            ) {
+              status = "success";
+            }
+
+            const logsToSave = bgResult.logs || bgResult.log || [];
+
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status,
+                summary: JSON.stringify(bgResult.summary || {}),
+                logs: JSON.stringify(logsToSave),
+                completedAt: new Date(),
+              },
+            });
+          } catch (err) {
+            await prisma.syncLog.update({
+              where: { id: syncLog.id },
+              data: {
+                status: "failed",
+                summary: JSON.stringify({ error: err.message }),
+                completedAt: new Date(),
+              },
+            });
+          }
+        })();
+
+        return {
+          started: true,
+          logId: syncLog.id,
+          message:
+            "Search & Discovery sync started and is running in the background. You can close this window.",
+        };
+      }
 
       default:
         result = {
@@ -540,6 +751,14 @@ const SYNC_TYPES = [
     description:
       "Sync collections and their product associations (run the product sync previously)",
     icon: CollectionIcon,
+    available: true,
+  },
+  {
+    id: "search_discovery",
+    label: "Search & Discovery Settings",
+    description:
+      "Translate product references in Search & Discovery app metafields (complementary/related products)",
+    icon: SettingsIcon,
     available: true,
   },
 ];
@@ -865,10 +1084,7 @@ export default function DataSync() {
         {/* Background running banner/progress (products) */}
         {activeLogId && backgroundStatus?.status === "in_progress" && (
           <Layout.Section>
-            <Banner
-              status="info"
-              title="Product sync is running in the background"
-            >
+            <Banner status="info" title="Sync is running in the background">
               <BlockStack gap="200">
                 <Text variant="bodyMd">
                   You can safely close this window; the sync continues in the
@@ -882,6 +1098,11 @@ export default function DataSync() {
                   }
                   size="small"
                 />
+                {backgroundStatus?.summary?.progress?.message && (
+                  <Text variant="bodySm" color="subdued">
+                    {backgroundStatus.summary.progress.message}
+                  </Text>
+                )}
                 {backgroundStatus?.summary?.progress?.stage && (
                   <Text variant="bodySm" color="subdued">
                     Stage: {backgroundStatus.summary.progress.stage}

@@ -8,11 +8,7 @@ import {
   syncMetafieldValues,
   syncMetafieldDefinitions,
 } from "./sync.metafields.server.js";
-import {
-  getLocations,
-  matchLocationsByName,
-  getInventoryLevels,
-} from "./sync.locations.helper.server.js";
+import { getInventoryLevels } from "./sync.locations.helper.server.js";
 import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 
 /**
@@ -524,6 +520,14 @@ async function getStagingProductByHandle(handle, stagingAdmin) {
               id
               sku
               title
+              inventoryItem {
+                id
+                tracked
+              }
+              selectedOptions {
+                name
+                value
+              }
             }
           }
         }
@@ -594,7 +598,7 @@ async function updateProductVariantsInStaging(
         userErrors {
           field
           message
-          code
+
         }
       }
     }
@@ -886,15 +890,28 @@ async function syncVariantInventory(
         0;
 
       console.log(
-        `Syncing inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units`,
+        `Syncing inventory for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}:`,
       );
+      console.log(
+        `  Production quantity: ${availableQty} (from ${prodLevel.quantities?.length || 0} quantity states)`,
+      );
+      console.log(
+        `  Production inventoryItem ID: ${prodVariant.inventoryItem.id}`,
+      );
+      console.log(
+        `  Staging inventoryItem ID: ${stagingVariant.inventoryItem.id}`,
+      );
+      console.log(`  Staging location ID: ${stagingLocationId}`);
 
-      // Set inventory quantity in staging
+      // Set inventory quantity using inventorySetQuantities mutation
+      // This mutation works for both initial setup and updates (unlike inventoryActivate which is deprecated for updates)
       const mutation = `
         mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
           inventorySetQuantities(input: $input) {
             inventoryAdjustmentGroup {
-              id
+              createdAt
+              reason
+              referenceDocumentUri
               changes {
                 name
                 delta
@@ -902,9 +919,9 @@ async function syncVariantInventory(
               }
             }
             userErrors {
+              code
               field
               message
-              code
             }
           }
         }
@@ -912,9 +929,10 @@ async function syncVariantInventory(
 
       const variables = {
         input: {
-          ignoreCompareQuantity: true,
-          reason: "Product sync from production",
+          ignoreCompareQuantity: true, // Ignore compare-and-swap to prevent concurrent update issues during sync
           name: "available",
+          reason: "correction",
+          referenceDocumentUri: `gid://staging-sync/InventorySync/${new Date().toISOString()}`,
           quantities: [
             {
               inventoryItemId: stagingVariant.inventoryItem.id,
@@ -926,8 +944,12 @@ async function syncVariantInventory(
       };
 
       try {
+        console.log(`  Sending inventorySetQuantities mutation...`);
         const response = await stagingAdmin.graphql(mutation, { variables });
         const result = await response.json();
+
+        // Log the full response for debugging
+        console.log(`  Response status: ${response.status || "unknown"}`);
 
         if (
           result.errors ||
@@ -936,18 +958,128 @@ async function syncVariantInventory(
           const errors =
             result.errors || result.data.inventorySetQuantities.userErrors;
           console.error(
-            `Failed to set inventory for ${prodVariant.sku} at ${prodLevel.location.name}:`,
-            errors,
+            `❌ Failed to set inventory for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}:`,
           );
+          console.error(`  Errors:`, JSON.stringify(errors, null, 2));
           results.failed.push({
             location: prodLevel.location.name,
-            sku: prodVariant.sku,
-            errors: errors.map((e) => e.message || e),
+            sku: prodVariant.sku || "[NO SKU]",
+            errors: errors.map((e) => e.message || e.code || JSON.stringify(e)),
           });
           results.success = false;
-        } else {
+        } else if (
+          !result.data?.inventorySetQuantities?.inventoryAdjustmentGroup
+        ) {
+          // inventoryAdjustmentGroup is null - try activating first, then setting quantity
+          console.warn(
+            `⚠️  inventoryAdjustmentGroup is null for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}`,
+          );
           console.log(
-            `✅ Set inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units`,
+            `  Attempting to activate inventory item at location first...`,
+          );
+
+          try {
+            // First, activate the inventory at the location (without setting quantity)
+            const activateMutation = `
+              mutation inventoryActivate($inventoryItemId: ID!, $locationId: ID!) {
+                inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+                  inventoryLevel { id }
+                  userErrors { field message }
+                }
+              }
+            `;
+
+            const activateVars = {
+              inventoryItemId: stagingVariant.inventoryItem.id,
+              locationId: stagingLocationId,
+            };
+
+            const activateResponse = await stagingAdmin.graphql(
+              activateMutation,
+              { variables: activateVars },
+            );
+            const activateResult = await activateResponse.json();
+
+            if (
+              activateResult.errors ||
+              activateResult.data?.inventoryActivate?.userErrors?.length > 0
+            ) {
+              const activateErrors =
+                activateResult.errors ||
+                activateResult.data.inventoryActivate.userErrors;
+              console.error(`  Failed to activate:`, activateErrors);
+              results.failed.push({
+                location: prodLevel.location.name,
+                sku: prodVariant.sku || "[NO SKU]",
+                errors: [
+                  "Failed to activate inventory",
+                  ...activateErrors.map((e) => e.message || e),
+                ],
+              });
+              results.success = false;
+            } else {
+              console.log(`  ✅ Activated inventory, now setting quantity...`);
+              // Now try setting quantity again
+              const retryResponse = await stagingAdmin.graphql(mutation, {
+                variables,
+              });
+              const retryResult = await retryResponse.json();
+
+              if (
+                retryResult.errors ||
+                retryResult.data?.inventorySetQuantities?.userErrors?.length >
+                  0 ||
+                !retryResult.data?.inventorySetQuantities
+                  ?.inventoryAdjustmentGroup
+              ) {
+                const retryErrors = retryResult.errors ||
+                  retryResult.data?.inventorySetQuantities?.userErrors || [
+                    "Still null after activation",
+                  ];
+                console.error(
+                  `  Failed to set quantity after activation:`,
+                  retryErrors,
+                );
+                results.failed.push({
+                  location: prodLevel.location.name,
+                  sku: prodVariant.sku || "[NO SKU]",
+                  errors: retryErrors.map(
+                    (e) => e.message || e.code || JSON.stringify(e),
+                  ),
+                });
+                results.success = false;
+              } else {
+                const changes =
+                  retryResult.data.inventorySetQuantities
+                    .inventoryAdjustmentGroup.changes;
+                const availableChange = changes.find(
+                  (c) => c.name === "available",
+                );
+                console.log(
+                  `✅ Set inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units (delta: ${availableChange?.delta || 0}) after activation`,
+                );
+                results.synced.push({
+                  location: prodLevel.location.name,
+                  sku: prodVariant.sku || "[NO SKU]",
+                  quantity: availableQty,
+                });
+              }
+            }
+          } catch (activateError) {
+            console.error(`  Error during activation attempt:`, activateError);
+            results.failed.push({
+              location: prodLevel.location.name,
+              sku: prodVariant.sku || "[NO SKU]",
+              errors: [`Activation attempt failed: ${activateError.message}`],
+            });
+            results.success = false;
+          }
+        } else {
+          const changes =
+            result.data.inventorySetQuantities.inventoryAdjustmentGroup.changes;
+          const availableChange = changes.find((c) => c.name === "available");
+          console.log(
+            `✅ Set inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units (delta: ${availableChange?.delta || 0})`,
           );
           results.synced.push({
             location: prodLevel.location.name,
@@ -1018,7 +1150,6 @@ async function createProductVariantsInStaging(
         userErrors {
           field
           message
-          code
         }
       }
     }
@@ -1732,41 +1863,57 @@ export async function syncProducts(
       },
     });
 
-    // Step 0: Get and match locations between stores
+    // Step 0: Load location mappings from database (created during location sync)
     log.push({
       timestamp: new Date().toISOString(),
-      message: "📍 Matching locations between stores...",
-      type: "location_matching",
+      message: "📍 Loading location mappings from database...",
+      type: "location_mapping",
     });
 
     onProgress({
       stage: "locations",
-      message: "Matching store locations...",
+      message: "Loading location mappings...",
       percentage: 2,
     });
 
     try {
-      const productionLocations = await getLocations(productionAdmin);
-      const stagingLocations = await getLocations(stagingAdmin);
+      if (storeConnectionId) {
+        // Import getMappings function
+        const { getMappings } = await import("./resource-mapping.server.js");
 
-      locationMap = matchLocationsByName(productionLocations, stagingLocations);
+        // Get location mappings from database
+        const locationMappings = await getMappings(
+          storeConnectionId,
+          "location",
+        );
 
-      log.push({
-        timestamp: new Date().toISOString(),
-        message: `✅ Matched ${locationMap.size} locations between stores`,
-        type: "location_matching",
-        success: true,
-        details: {
-          productionLocations: productionLocations.length,
-          stagingLocations: stagingLocations.length,
-          matched: locationMap.size,
-        },
-      });
+        // Build map: production GID -> staging GID
+        locationMap = new Map(
+          locationMappings.map((m) => [m.productionGid, m.stagingGid]),
+        );
+
+        log.push({
+          timestamp: new Date().toISOString(),
+          message: `✅ Loaded ${locationMap.size} location mappings from database`,
+          type: "location_mapping",
+          success: true,
+          details: {
+            mappingsLoaded: locationMap.size,
+          },
+        });
+      } else {
+        log.push({
+          timestamp: new Date().toISOString(),
+          message: `⚠️ No storeConnectionId provided. Skipping location mapping.`,
+          type: "location_mapping",
+          success: false,
+        });
+      }
     } catch (error) {
       log.push({
         timestamp: new Date().toISOString(),
-        message: `⚠️ Failed to match locations: ${error.message}. Continuing without inventory sync.`,
-        type: "location_matching",
+        message: `⚠️ Failed to load location mappings: ${error.message}. Continuing without inventory sync.`,
+        type: "location_mapping",
         success: false,
         error: error.message,
       });
@@ -2004,7 +2151,7 @@ export async function syncProducts(
             }
           }
 
-          // Sync variant metafields for existing variants
+          // Sync variant metafields and inventory for existing variants
           if (product.variants?.edges && existingProduct.variants?.edges) {
             console.log(
               `Product ${product.title} has ${product.variants.edges.length} production variants and ${existingProduct.variants.edges.length} staging variants`,
@@ -2013,22 +2160,31 @@ export async function syncProducts(
             for (const variantEdge of product.variants.edges) {
               const variant = variantEdge.node;
               console.log(
-                `Checking variant: ${variant.title} (SKU: ${variant.sku}), has ${variant.metafields?.nodes?.length || 0} metafields`,
+                `Processing variant: ${variant.title} (SKU: ${variant.sku})`,
               );
 
-              if (variant.metafields?.nodes?.length > 0) {
-                // Find corresponding variant in staging (by SKU or title)
-                const stagingVariant = existingProduct.variants.edges.find(
-                  (sv) =>
-                    sv.node.sku === variant.sku ||
-                    sv.node.title === variant.title,
+              // Find corresponding variant in staging (by matching selectedOptions)
+              const stagingVariant = existingProduct.variants.edges.find(
+                (sv) => {
+                  const prodOptions = variant.selectedOptions
+                    .map((o) => `${o.name}:${o.value}`)
+                    .sort()
+                    .join("|");
+                  const stagingOptions = sv.node.selectedOptions
+                    .map((o) => `${o.name}:${o.value}`)
+                    .sort()
+                    .join("|");
+                  return prodOptions === stagingOptions;
+                },
+              );
+
+              if (stagingVariant) {
+                console.log(
+                  `Found matching staging variant: ${stagingVariant.node.title} (ID: ${stagingVariant.node.id})`,
                 );
 
-                if (stagingVariant) {
-                  console.log(
-                    `Found matching staging variant: ${stagingVariant.node.title} (ID: ${stagingVariant.node.id})`,
-                  );
-
+                // Sync metafields if variant has any
+                if (variant.metafields?.nodes?.length > 0) {
                   log.push({
                     timestamp: new Date().toISOString(),
                     message: `🏷️ Syncing metafields for variant: ${variant.title}`,
@@ -2055,46 +2211,73 @@ export async function syncProducts(
                       variantMetafieldsResult,
                     );
                   }
+                }
 
-                  // Sync inventory for this variant if locations are mapped
-                  if (locationMap.size > 0 && variant.inventoryItem?.id) {
-                    console.log(
-                      `Syncing inventory for variant: ${variant.title} (SKU: ${variant.sku})`,
-                    );
+                // Sync inventory for ALL variants (not just those with metafields)
+                if (
+                  locationMap.size > 0 &&
+                  variant.inventoryItem?.id &&
+                  stagingVariant.node.inventoryItem?.id
+                ) {
+                  console.log(
+                    `Syncing inventory for variant: ${variant.title} (SKU: ${variant.sku})`,
+                  );
+                  console.log(
+                    `  Production inventoryItem: ${variant.inventoryItem.id}`,
+                  );
+                  console.log(
+                    `  Staging inventoryItem: ${stagingVariant.node.inventoryItem.id}`,
+                  );
 
-                    const inventoryResult = await syncVariantInventory(
-                      variant,
-                      stagingVariant.node,
-                      locationMap,
-                      productionAdmin,
-                      stagingAdmin,
-                    );
+                  const inventoryResult = await syncVariantInventory(
+                    variant,
+                    stagingVariant.node,
+                    locationMap,
+                    productionAdmin,
+                    stagingAdmin,
+                  );
 
-                    if (inventoryResult.success) {
-                      summary.inventory.synced += inventoryResult.synced.length;
-                      log.push({
-                        timestamp: new Date().toISOString(),
-                        message: `✅ Synced inventory for ${variant.sku} across ${inventoryResult.synced.length} locations`,
-                        type: "inventory_sync",
-                        success: true,
-                        details: inventoryResult.synced,
-                      });
-                    } else if (inventoryResult.failed.length > 0) {
-                      summary.inventory.failed += inventoryResult.failed.length;
-                      log.push({
-                        timestamp: new Date().toISOString(),
-                        message: `⚠️ Partial inventory sync for ${variant.sku}: ${inventoryResult.failed.length} locations failed`,
-                        type: "inventory_sync",
-                        success: false,
-                        details: inventoryResult.failed,
-                      });
-                    }
+                  if (
+                    inventoryResult.success &&
+                    inventoryResult.synced.length > 0
+                  ) {
+                    summary.inventory.synced += inventoryResult.synced.length;
+                    log.push({
+                      timestamp: new Date().toISOString(),
+                      message: `✅ Activated inventory for ${variant.sku} across ${inventoryResult.synced.length} locations`,
+                      type: "inventory_sync",
+                      success: true,
+                      details: inventoryResult.synced,
+                    });
+                  } else if (inventoryResult.failed.length > 0) {
+                    summary.inventory.failed += inventoryResult.failed.length;
+                    log.push({
+                      timestamp: new Date().toISOString(),
+                      message: `⚠️ Partial inventory sync for ${variant.sku}: ${inventoryResult.failed.length} locations failed`,
+                      type: "inventory_sync",
+                      success: false,
+                      details: inventoryResult.failed,
+                    });
                   }
                 } else {
-                  console.log(
-                    `❌ No matching staging variant found for: ${variant.title} (SKU: ${variant.sku})`,
-                  );
+                  if (!variant.inventoryItem?.id) {
+                    console.log(
+                      `⚠️ Skipping inventory sync - production variant ${variant.sku} has no inventoryItem`,
+                    );
+                  } else if (!stagingVariant.node.inventoryItem?.id) {
+                    console.log(
+                      `⚠️ Skipping inventory sync - staging variant has no inventoryItem`,
+                    );
+                  } else if (locationMap.size === 0) {
+                    console.log(
+                      `⚠️ Skipping inventory sync - no location mappings found`,
+                    );
+                  }
                 }
+              } else {
+                console.log(
+                  `❌ No matching staging variant found for: ${variant.title} (SKU: ${variant.sku})`,
+                );
               }
             }
           }
