@@ -1,4 +1,4 @@
-# Production-Staging Sync App
+# StageSync
 
 A Shopify app that synchronizes metaobject and metafield definitions between production and staging stores. This app helps maintain consistency across environments during development and testing.
 
@@ -90,8 +90,6 @@ To properly test market currency sync, enable a multi-currency payment gateway o
 For database management and debugging during development, you can use Prisma Studio:
 
 ```bash
-# Open a new terminal in the app-staging directory
-cd app-staging
 npm run studio
 # or
 npx prisma studio
@@ -222,7 +220,7 @@ Navigate to **Sync** to synchronize definitions:
 
 1. **One-Way Sync**: Only syncs from production to staging (not bidirectional)
 2. **Definition Only**: Syncs schemas/definitions, not actual data/values
-3. **Manual Process**: No automatic sync scheduling or webhooks
+3. **Scheduling**: Supports automatic sync scheduling via the Scheduled Syncs page
 
 ## Error Messages and Solutions
 
@@ -310,7 +308,7 @@ This ensures all dependencies exist before creating references.
 
 If you're having trouble with app authentication during development:
 
-1. Open Prisma Studio: `cd app-staging && npm run studio`
+1. Open Prisma Studio: `npm run studio`
 2. Check the `Session` table for your current session
 3. Verify the session hasn't expired
 4. If needed, delete old sessions and re-authenticate
@@ -344,14 +342,14 @@ cd app-staging
 npm run studio
 ```
 
-The Prisma schema is located at `app-staging/prisma/schema.prisma`.
+The Prisma schema is located at `prisma/schema.prisma`.
 
 ## Development
 
 ### Project Structure
 
 ```
-app-staging/
+stagesync/
 ├── app/
 │   ├── routes/           # Remix routes
 │   ├── services/         # Sync logic
@@ -378,7 +376,6 @@ app-staging/
 During development, you can use Prisma Studio to inspect and manage your database:
 
 ```bash
-cd app-staging
 npm run studio
 # or
 npx prisma studio
@@ -410,9 +407,7 @@ Follow the standard [Shopify app deployment guide](https://shopify.dev/docs/apps
 
 1. **Dependency Resolution**: Automatically handle metaobject reference fields
 2. **Bidirectional Sync**: Support syncing from staging back to production
-3. **Scheduled Sync**: Automated sync on a schedule
-4. **Selective Sync**: Choose specific definitions to sync
-5. **Data Migration**: Sync actual metafield/metaobject values, not just definitions
+3. **Selective Sync**: Choose specific definitions to sync
 
 ## Resources
 

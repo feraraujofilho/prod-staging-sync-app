@@ -1,19 +1,20 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "13505892abdbf94520f2bba232bbcb3a"
-name = "app-staging"
+client_id = "497e7a0749889b853cdf8fd54b0bab38"
+name = "StageSync"
 application_url = "https://example.com"
 embedded = true
 
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
 [webhooks]
-api_version = "2025-10"
+api_version = "2026-01"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_companies,read_customers,read_inventory,read_locales,read_locations,read_markets,read_metaobject_definitions,read_online_store_navigation,read_online_store_pages,write_files,write_inventory,write_locales,write_locations,write_markets,write_metaobject_definitions,write_online_store_navigation,write_online_store_pages,write_products,write_publications"
+scopes = "read_companies,read_customers,read_inventory,read_locales,read_locations,read_markets,read_metaobject_definitions,read_online_store_navigation,read_online_store_pages,read_product_listings,write_files,write_inventory,write_locales,write_locations,write_markets,write_metaobject_definitions,write_online_store_navigation,write_online_store_pages,write_products,write_publications"
 
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
-
-[build]
-automatically_update_urls_on_dev = true

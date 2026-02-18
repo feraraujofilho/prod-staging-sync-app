@@ -45,7 +45,10 @@ export function normalizeResourceType(gidType) {
     GenericFile: "file",
     Video: "file",
     Metaobject: "metaobject",
+    MetaobjectDefinition: "metaobject_definition",
     Menu: "navigation",
+    InventoryItem: "inventory_item",
+    InventoryLevel: "inventory_level",
   };
   return typeMap[gidType] || gidType?.toLowerCase();
 }

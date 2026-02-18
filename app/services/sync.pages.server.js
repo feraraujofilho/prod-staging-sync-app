@@ -13,8 +13,8 @@ import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
  */
 async function getProductionPages(productionStore, accessToken) {
   const query = `
-    query GetPages($first: Int!) {
-      pages(first: $first) {
+    query GetPages($first: Int!, $after: String) {
+      pages(first: $first, after: $after) {
         edges {
           node {
             id
@@ -28,47 +28,63 @@ async function getProductionPages(productionStore, accessToken) {
             updatedAt
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
-  const response = await fetch(
-    `https://${productionStore}/admin/api/2025-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": accessToken,
+  const allPages = [];
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const response = await fetch(
+      `https://${productionStore}/admin/api/2025-07/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": accessToken,
+        },
+        body: JSON.stringify({
+          query,
+          variables: { first: 250, after: cursor },
+        }),
       },
-      body: JSON.stringify({
-        query,
-        variables: { first: 250 }, // Fetch up to 250 pages
-      }),
-    },
-  );
-
-  const data = await response.json();
-
-  if (data.errors) {
-    console.error("Error fetching production pages:", data.errors);
-    const scopeError = data.errors.find(
-      (error) =>
-        error.message.includes("Access denied") ||
-        error.message.includes("pages field"),
     );
-    if (scopeError) {
+
+    const data = await response.json();
+
+    if (data.errors) {
+      console.error("Error fetching production pages:", data.errors);
+      const scopeError = data.errors.find(
+        (error) =>
+          error.message.includes("Access denied") ||
+          error.message.includes("pages field"),
+      );
+      if (scopeError) {
+        throw new Error(
+          "Access denied for pages. Please ensure the app has 'read_online_store_pages' scope and reinstall the app if needed.",
+        );
+      }
       throw new Error(
-        "Access denied for pages. Please ensure the app has 'read_online_store_pages' scope and reinstall the app if needed.",
+        `Failed to fetch production pages: ${data.errors
+          .map((e) => e.message)
+          .join(", ")}`,
       );
     }
-    throw new Error(
-      `Failed to fetch production pages: ${data.errors
-        .map((e) => e.message)
-        .join(", ")}`,
-    );
+
+    const edges = data.data?.pages?.edges || [];
+    allPages.push(...edges.map((edge) => edge.node));
+
+    hasNextPage = data.data?.pages?.pageInfo?.hasNextPage || false;
+    cursor = data.data?.pages?.pageInfo?.endCursor || null;
   }
 
-  return data.data?.pages?.edges?.map((edge) => edge.node) || [];
+  return allPages;
 }
 
 /**
@@ -79,8 +95,8 @@ async function getProductionPages(productionStore, accessToken) {
  */
 async function getStagingPageByHandle(handle, stagingAdmin) {
   const query = `
-    query GetPages($first: Int!) {
-      pages(first: $first) {
+    query GetPages($first: Int!, $after: String) {
+      pages(first: $first, after: $after) {
         edges {
           node {
             id
@@ -92,24 +108,39 @@ async function getStagingPageByHandle(handle, stagingAdmin) {
             templateSuffix
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
-  const response = await stagingAdmin.graphql(query, {
-    variables: { first: 250 }, // Fetch up to 250 pages
-  });
-  const result = await response.json();
+  let hasNextPage = true;
+  let cursor = null;
 
-  if (result.errors) {
-    console.error("Error checking staging page:", result.errors);
-    return null;
+  while (hasNextPage) {
+    const response = await stagingAdmin.graphql(query, {
+      variables: { first: 250, after: cursor },
+    });
+    const result = await response.json();
+
+    if (result.errors) {
+      console.error("Error checking staging page:", result.errors);
+      return null;
+    }
+
+    const pages = result.data?.pages?.edges || [];
+    const matchingPage = pages.find((page) => page.node.handle === handle);
+    if (matchingPage) {
+      return matchingPage.node;
+    }
+
+    hasNextPage = result.data?.pages?.pageInfo?.hasNextPage || false;
+    cursor = result.data?.pages?.pageInfo?.endCursor || null;
   }
 
-  const pages = result.data?.pages?.edges || [];
-  // Filter pages by handle in JavaScript since GraphQL doesn't support query filtering for pages
-  const matchingPage = pages.find((page) => page.node.handle === handle);
-  return matchingPage ? matchingPage.node : null;
+  return null;
 }
 
 /**

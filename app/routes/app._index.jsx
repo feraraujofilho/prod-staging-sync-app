@@ -28,7 +28,7 @@ export const loader = async ({ request }) => {
 export default function Index() {
   return (
     <Page>
-      <TitleBar title="Store Data Sync Tool" />
+      <TitleBar title="StageSync" />
       <BlockStack gap="500">
         <Layout>
           <Layout.Section>
@@ -36,7 +36,7 @@ export default function Index() {
               <BlockStack gap="500">
                 <BlockStack gap="200">
                   <Text as="h2" variant="headingMd">
-                    Welcome to Store Data Sync Tool
+                    Welcome to StageSync
                   </Text>
                   <Text variant="bodyMd" as="p">
                     This app helps you synchronize data between your production

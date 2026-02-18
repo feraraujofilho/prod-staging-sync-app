@@ -51,7 +51,7 @@ async function getProductionLocations(productionStore, accessToken) {
   while (hasNextPage) {
     try {
       const response = await fetch(
-        `https://${productionStore}/admin/api/2025-01/graphql.json`,
+        `https://${productionStore}/admin/api/2025-07/graphql.json`,
         {
           method: "POST",
           headers: {

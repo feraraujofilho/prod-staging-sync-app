@@ -440,7 +440,7 @@ export default function Settings() {
                     read_products, read_files, read_online_store_navigation,
                     read_online_store_pages, read_markets, read_companies,
                     read_customers, read_locales, read_product_listings,
-                    read_locations
+                    read_locations, read_inventory, write_inventory
                   </Text>
                 </Box>
               </Banner>

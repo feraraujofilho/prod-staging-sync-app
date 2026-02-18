@@ -10,8 +10,8 @@ import {
   extractResourceTypeFromGid,
 } from "../services/resource-mapping.server.js";
 
-// Regex pattern to match Shopify GIDs
-const GID_PATTERN = /gid:\/\/shopify\/([A-Za-z]+)\/(\d+)/g;
+// Regex pattern to match Shopify GIDs (no /g flag for boolean tests)
+const GID_PATTERN_SINGLE = /gid:\/\/shopify\/([A-Za-z]+)\/(\d+)/;
 
 /**
  * Check if a string contains GID references
@@ -20,7 +20,7 @@ const GID_PATTERN = /gid:\/\/shopify\/([A-Za-z]+)\/(\d+)/g;
  */
 export function containsGids(value) {
   if (typeof value !== "string") return false;
-  return GID_PATTERN.test(value);
+  return GID_PATTERN_SINGLE.test(value);
 }
 
 /**
@@ -31,7 +31,7 @@ export function containsGids(value) {
 export function extractGids(value) {
   if (typeof value !== "string") return [];
   const gids = [];
-  const regex = new RegExp(GID_PATTERN);
+  const regex = /gid:\/\/shopify\/([A-Za-z]+)\/(\d+)/g;
   let match;
   while ((match = regex.exec(value)) !== null) {
     gids.push(match[0]);
@@ -129,16 +129,16 @@ export async function translateGidsInString(
     }
   }
 
-  // If we have unmapped references, we might want to skip this value entirely
-  // to avoid broken references in staging
-  const skipValue = unmappedCount > 0;
-
+  // Best-effort: return the partially translated value even if some GIDs
+  // couldn't be mapped. The unmapped GIDs stay as production GIDs which is
+  // better than nulling the entire value and losing all data.
   return {
-    value: skipValue ? null : translatedValue,
+    value: translatedValue,
     originalValue: value,
     translated: translatedCount,
     unmapped: unmappedCount,
-    skipped: skipValue,
+    skipped: false,
+    partiallyTranslated: unmappedCount > 0 && translatedCount > 0,
   };
 }
 
@@ -178,14 +178,10 @@ export async function translateGidsInArray(
         syncType,
       );
 
-      if (!result.skipped && result.value) {
-        translatedArray.push(result.value);
-        totalTranslated += result.translated;
-        totalUnmapped += result.unmapped;
-      } else {
-        // Skip items with unmapped references
-        totalUnmapped += result.unmapped;
-      }
+      // Best-effort: keep the item with whatever translation was possible
+      translatedArray.push(result.value);
+      totalTranslated += result.translated;
+      totalUnmapped += result.unmapped;
     } else {
       translatedArray.push(item);
     }
@@ -247,13 +243,10 @@ export async function translateGidsInObject(
         syncType,
       );
 
-      if (!result.skipped && result.value) {
-        translatedObj[key] = result.value;
-        totalTranslated += result.translated;
-        totalUnmapped += result.unmapped;
-      } else {
-        totalUnmapped += result.unmapped;
-      }
+      // Best-effort: keep the value with whatever translation was possible
+      translatedObj[key] = result.value;
+      totalTranslated += result.translated;
+      totalUnmapped += result.unmapped;
     } else if (typeof value === "object" && value !== null) {
       const result = await translateGidsInObject(
         storeConnectionId,
@@ -368,8 +361,97 @@ export async function translateMetafieldValue(
       }
     }
 
+    // Single GID reference types — translate the GID directly
+    case "product_reference":
+    case "collection_reference":
+    case "variant_reference":
+    case "metaobject_reference":
+    case "page_reference":
+    case "file_reference": {
+      if (typeof value === "string" && containsGids(value)) {
+        const result = await translateGid(
+          storeConnectionId,
+          value,
+          context,
+          syncType,
+        );
+        return {
+          ...metafield,
+          value: result.success ? result.stagingGid : value,
+          translationStats: {
+            translated: result.success ? 1 : 0,
+            unmapped: result.success ? 0 : 1,
+            skipped: false,
+          },
+        };
+      }
+      return { ...metafield, translationStats: { translated: 0, unmapped: 0, skipped: false } };
+    }
+
+    // List GID reference types — JSON array of GIDs
+    case "list.product_reference":
+    case "list.collection_reference":
+    case "list.variant_reference":
+    case "list.metaobject_reference":
+    case "list.page_reference":
+    case "list.file_reference": {
+      try {
+        const gidArray = typeof value === "string" ? JSON.parse(value) : value;
+        if (!Array.isArray(gidArray)) {
+          return { ...metafield, translationStats: { translated: 0, unmapped: 0, skipped: false } };
+        }
+        const translatedGids = [];
+        let refTranslated = 0;
+        let refUnmapped = 0;
+        for (const gid of gidArray) {
+          if (typeof gid === "string" && containsGids(gid)) {
+            const result = await translateGid(storeConnectionId, gid, context, syncType);
+            translatedGids.push(result.success ? result.stagingGid : gid);
+            if (result.success) refTranslated++;
+            else refUnmapped++;
+          } else {
+            translatedGids.push(gid);
+          }
+        }
+        return {
+          ...metafield,
+          value: JSON.stringify(translatedGids),
+          translationStats: {
+            translated: refTranslated,
+            unmapped: refUnmapped,
+            skipped: false,
+          },
+        };
+      } catch (error) {
+        console.error(`Error parsing list reference metafield ${namespace}.${key}:`, error);
+        return { ...metafield, translationStats: { translated: 0, unmapped: 0, skipped: false } };
+      }
+    }
+
+    // Mixed/resource reference type — single GID that could be any resource
+    case "resource_reference": {
+      if (typeof value === "string" && containsGids(value)) {
+        const result = await translateGid(
+          storeConnectionId,
+          value,
+          context,
+          syncType,
+        );
+        return {
+          ...metafield,
+          value: result.success ? result.stagingGid : value,
+          translationStats: {
+            translated: result.success ? 1 : 0,
+            unmapped: result.success ? 0 : 1,
+            skipped: false,
+          },
+        };
+      }
+      return { ...metafield, translationStats: { translated: 0, unmapped: 0, skipped: false } };
+    }
+
     default:
-      // For other types, return as-is
+      // For other types (number, boolean, date, color, etc.), return as-is
       return { ...metafield, translationStats: { translated: 0, unmapped: 0, skipped: false } };
   }
 }
@@ -416,16 +498,15 @@ export async function translateMetafields(
       syncType,
     );
 
-    // Only include metafields that weren't skipped
-    if (!result.translationStats.skipped) {
-      translatedMetafields.push(result);
-      stats.translated += result.translationStats.translated;
-      stats.unmapped += result.translationStats.unmapped;
-    } else {
-      stats.skipped++;
-      stats.unmapped += result.translationStats.unmapped;
+    // Best-effort: always include translated metafields even if some GIDs
+    // couldn't be mapped. Unmapped GIDs stay as production GIDs.
+    translatedMetafields.push(result);
+    stats.translated += result.translationStats.translated;
+    stats.unmapped += result.translationStats.unmapped;
+
+    if (result.translationStats.unmapped > 0) {
       console.warn(
-        `⚠️ Skipped metafield ${metafield.namespace}.${metafield.key} for ${ownerContext} due to unmapped references`,
+        `⚠️ Metafield ${metafield.namespace}.${metafield.key} for ${ownerContext} has ${result.translationStats.unmapped} unmapped reference(s) (kept as-is)`,
       );
     }
   }

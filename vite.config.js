@@ -73,9 +73,14 @@ export default defineConfig({
     // Increase memory allocation for build process
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ["react", "react-dom"],
-          shopify: ["@shopify/app-bridge-react", "@shopify/polaris"],
+        manualChunks(id) {
+          // Only split vendor chunks for client builds (not SSR)
+          if (id.includes("node_modules/@shopify/polaris")) {
+            return "shopify";
+          }
+          if (id.includes("node_modules/@shopify/app-bridge")) {
+            return "shopify";
+          }
         },
       },
     },

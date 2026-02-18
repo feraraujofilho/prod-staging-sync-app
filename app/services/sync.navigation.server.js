@@ -8,8 +8,8 @@
 import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 async function getProductionMenus(productionStore, accessToken) {
   const query = `
-    query GetMenus {
-      menus(first: 50) {
+    query GetMenus($first: Int!, $after: String) {
+      menus(first: $first, after: $after) {
         edges {
           node {
             id
@@ -42,46 +42,64 @@ async function getProductionMenus(productionStore, accessToken) {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
-  const response = await fetch(
-    `https://${productionStore}/admin/api/2025-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": accessToken,
+  const allMenus = [];
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const response = await fetch(
+      `https://${productionStore}/admin/api/2025-07/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": accessToken,
+        },
+        body: JSON.stringify({
+          query,
+          variables: { first: 50, after: cursor },
+        }),
       },
-      body: JSON.stringify({ query }),
-    },
-  );
-
-  const data = await response.json();
-
-  if (data.errors) {
-    console.error("Error fetching production menus:", data.errors);
-
-    // Check for specific scope-related errors
-    const scopeError = data.errors.find(
-      (error) =>
-        error.message.includes("Access denied") ||
-        error.message.includes("menus field"),
     );
 
-    if (scopeError) {
+    const data = await response.json();
+
+    if (data.errors) {
+      console.error("Error fetching production menus:", data.errors);
+
+      const scopeError = data.errors.find(
+        (error) =>
+          error.message.includes("Access denied") ||
+          error.message.includes("menus field"),
+      );
+
+      if (scopeError) {
+        throw new Error(
+          "Access denied for menus. Please ensure the app has 'read_online_store_navigation' scope and reinstall the app if needed.",
+        );
+      }
+
       throw new Error(
-        "Access denied for menus. Please ensure the app has 'read_online_store_navigation' scope and reinstall the app if needed.",
+        `Failed to fetch production menus: ${data.errors.map((e) => e.message).join(", ")}`,
       );
     }
 
-    throw new Error(
-      `Failed to fetch production menus: ${data.errors.map((e) => e.message).join(", ")}`,
-    );
+    const edges = data.data?.menus?.edges || [];
+    allMenus.push(...edges.map((edge) => edge.node));
+
+    hasNextPage = data.data?.menus?.pageInfo?.hasNextPage || false;
+    cursor = data.data?.menus?.pageInfo?.endCursor || null;
   }
 
-  return data.data?.menus?.edges?.map((edge) => edge.node) || [];
+  return allMenus;
 }
 
 /**
@@ -108,7 +126,7 @@ async function getStagingMenuByHandle(handle, stagingAdmin) {
 
   const response = await stagingAdmin.graphql(query, {
     variables: {
-      query: `handle:"${handle}"`,
+      query: `handle:"${handle.replace(/"/g, '\\"')}"`,
     },
   });
 
@@ -124,32 +142,47 @@ async function getStagingMenuByHandle(handle, stagingAdmin) {
  */
 async function getStagingPageIdByHandle(handle, stagingAdmin) {
   const query = `
-    query GetPages($first: Int!) {
-      pages(first: $first) {
+    query GetPages($first: Int!, $after: String) {
+      pages(first: $first, after: $after) {
         edges {
           node {
             id
             handle
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
-  const response = await stagingAdmin.graphql(query, {
-    variables: { first: 250 }, // Fetch up to 250 pages
-  });
-  const result = await response.json();
+  let hasNextPage = true;
+  let cursor = null;
 
-  if (result.errors) {
-    console.error("Error getting staging page ID:", result.errors);
-    return null;
+  while (hasNextPage) {
+    const response = await stagingAdmin.graphql(query, {
+      variables: { first: 250, after: cursor },
+    });
+    const result = await response.json();
+
+    if (result.errors) {
+      console.error("Error getting staging page ID:", result.errors);
+      return null;
+    }
+
+    const pages = result.data?.pages?.edges || [];
+    const matchingPage = pages.find((page) => page.node.handle === handle);
+    if (matchingPage) {
+      return matchingPage.node.id;
+    }
+
+    hasNextPage = result.data?.pages?.pageInfo?.hasNextPage || false;
+    cursor = result.data?.pages?.pageInfo?.endCursor || null;
   }
 
-  const pages = result.data?.pages?.edges || [];
-  // Filter pages by handle in JavaScript since GraphQL doesn't support query filtering for pages
-  const matchingPage = pages.find((page) => page.node.handle === handle);
-  return matchingPage ? matchingPage.node.id : null;
+  return null;
 }
 
 /**
@@ -160,31 +193,47 @@ async function getStagingPageIdByHandle(handle, stagingAdmin) {
  */
 async function getStagingCollectionIdByHandle(handle, stagingAdmin) {
   const query = `
-    query GetCollections($first: Int!) {
-      collections(first: $first) {
+    query GetCollections($first: Int!, $after: String) {
+      collections(first: $first, after: $after) {
         edges {
           node {
             id
             handle
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
-  const response = await stagingAdmin.graphql(query, {
-    variables: { first: 250 }, // Fetch up to 250 collections
-  });
-  const result = await response.json();
-  if (result.errors) {
-    console.error("Error getting staging collection ID:", result.errors);
-    return null;
+
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const response = await stagingAdmin.graphql(query, {
+      variables: { first: 250, after: cursor },
+    });
+    const result = await response.json();
+    if (result.errors) {
+      console.error("Error getting staging collection ID:", result.errors);
+      return null;
+    }
+    const collections = result.data?.collections?.edges || [];
+    const matchingCollection = collections.find(
+      (collection) => collection.node.handle === handle,
+    );
+    if (matchingCollection) {
+      return matchingCollection.node.id;
+    }
+
+    hasNextPage = result.data?.collections?.pageInfo?.hasNextPage || false;
+    cursor = result.data?.collections?.pageInfo?.endCursor || null;
   }
-  const collections = result.data?.collections?.edges || [];
-  // Filter collections by handle in JavaScript since GraphQL doesn't support query filtering for collections
-  const matchingCollection = collections.find(
-    (collection) => collection.node.handle === handle,
-  );
-  return matchingCollection ? matchingCollection.node.id : null;
+
+  return null;
 }
 
 /**
@@ -195,32 +244,48 @@ async function getStagingCollectionIdByHandle(handle, stagingAdmin) {
  */
 async function getStagingCustomerAccountPageIdByHandle(handle, stagingAdmin) {
   const query = `
-    query GetCustomerAccountPages($first: Int!) {
-      customerAccountPages(first: $first) {
+    query GetCustomerAccountPages($first: Int!, $after: String) {
+      customerAccountPages(first: $first, after: $after) {
         edges {
           node {
             id
             handle
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
-  const response = await stagingAdmin.graphql(query, {
-    variables: { first: 250 }, // Fetch up to 250 customer account pages
-  });
-  const result = await response.json();
-  if (result.errors) {
-    console.error(
-      "Error getting staging customer account page ID:",
-      result.errors,
-    );
-    return null;
+
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const response = await stagingAdmin.graphql(query, {
+      variables: { first: 250, after: cursor },
+    });
+    const result = await response.json();
+    if (result.errors) {
+      console.error(
+        "Error getting staging customer account page ID:",
+        result.errors,
+      );
+      return null;
+    }
+    const pages = result.data?.customerAccountPages?.edges || [];
+    const matchingPage = pages.find((page) => page.node.handle === handle);
+    if (matchingPage) {
+      return matchingPage.node.id;
+    }
+
+    hasNextPage = result.data?.customerAccountPages?.pageInfo?.hasNextPage || false;
+    cursor = result.data?.customerAccountPages?.pageInfo?.endCursor || null;
   }
-  const pages = result.data?.customerAccountPages?.edges || [];
-  // Filter pages by handle in JavaScript since GraphQL doesn't support query filtering for customer account pages
-  const matchingPage = pages.find((page) => page.node.handle === handle);
-  return matchingPage ? matchingPage.node.id : null;
+
+  return null;
 }
 
 /**

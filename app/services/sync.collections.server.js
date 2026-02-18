@@ -136,19 +136,23 @@ async function getProductionCollections(
  */
 async function getStagingCollectionByHandle(handle, stagingAdmin) {
   const query = `
-    query GetCollectionByHandle($handle: String!) {
+    query GetCollectionByHandle($handle: String!, $productsAfter: String) {
       collectionByHandle(handle: $handle) {
         id
         handle
         title
         description
         sortOrder
-        products(first: 250) {
+        products(first: 250, after: $productsAfter) {
           edges {
             node {
               id
               handle
             }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
           }
         }
       }
@@ -156,7 +160,8 @@ async function getStagingCollectionByHandle(handle, stagingAdmin) {
   `;
 
   try {
-    const variables = { handle };
+    // First fetch to get the collection and initial products
+    const variables = { handle, productsAfter: null };
     const response = await stagingAdmin.graphql(query, { variables });
     const result = await response.json();
 
@@ -165,7 +170,34 @@ async function getStagingCollectionByHandle(handle, stagingAdmin) {
       return null;
     }
 
-    return result.data?.collectionByHandle || null;
+    const collection = result.data?.collectionByHandle;
+    if (!collection) return null;
+
+    // Paginate through remaining products
+    let hasNextPage = collection.products?.pageInfo?.hasNextPage || false;
+    let cursor = collection.products?.pageInfo?.endCursor || null;
+    const allProductEdges = [...(collection.products?.edges || [])];
+
+    while (hasNextPage) {
+      const nextResp = await stagingAdmin.graphql(query, {
+        variables: { handle, productsAfter: cursor },
+      });
+      const nextResult = await nextResp.json();
+      const nextCollection = nextResult.data?.collectionByHandle;
+      if (!nextCollection) break;
+
+      const edges = nextCollection.products?.edges || [];
+      allProductEdges.push(...edges);
+
+      hasNextPage = nextCollection.products?.pageInfo?.hasNextPage || false;
+      cursor = nextCollection.products?.pageInfo?.endCursor || null;
+    }
+
+    // Return collection with all products
+    return {
+      ...collection,
+      products: { edges: allProductEdges },
+    };
   } catch (error) {
     console.error("Error getting staging collection by handle:", error);
     return null;
@@ -184,13 +216,17 @@ async function findStagingProductsByHandles(productHandles, stagingAdmin) {
   }
 
   const query = `
-    query GetProductsByHandles($queryString: String!) {
-      products(first: 250, query: $queryString) {
+    query GetProductsByHandles($queryString: String!, $after: String) {
+      products(first: 250, query: $queryString, after: $after) {
         edges {
           node {
             id
             handle
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -205,21 +241,31 @@ async function findStagingProductsByHandles(productHandles, stagingAdmin) {
     console.log(`Searching for products with query: ${handleQuery}`);
     console.log(`Product handles to find: ${productHandles.join(", ")}`);
 
-    const variables = { queryString: handleQuery };
-    const response = await stagingAdmin.graphql(query, { variables });
-    const result = await response.json();
+    const allProducts = [];
+    let hasNextPage = true;
+    let cursor = null;
 
-    if (result.errors) {
-      console.error("Error finding staging products:", result.errors);
-      return [];
+    while (hasNextPage) {
+      const variables = { queryString: handleQuery, after: cursor };
+      const response = await stagingAdmin.graphql(query, { variables });
+      const result = await response.json();
+
+      if (result.errors) {
+        console.error("Error finding staging products:", result.errors);
+        break;
+      }
+
+      const edges = result.data?.products?.edges || [];
+      allProducts.push(...edges.map((edge) => edge.node));
+
+      hasNextPage = result.data?.products?.pageInfo?.hasNextPage || false;
+      cursor = result.data?.products?.pageInfo?.endCursor || null;
     }
 
-    const foundProducts =
-      result.data?.products?.edges?.map((edge) => edge.node) || [];
-    console.log(`Found ${foundProducts.length} products in staging:`);
-    foundProducts.forEach((p) => console.log(`  - ${p.handle} (${p.id})`));
+    console.log(`Found ${allProducts.length} products in staging:`);
+    allProducts.forEach((p) => console.log(`  - ${p.handle} (${p.id})`));
 
-    return foundProducts.map((p) => p.id);
+    return allProducts.map((p) => p.id);
   } catch (error) {
     console.error("Error finding staging products by handles:", error);
     return [];
@@ -383,6 +429,30 @@ async function updateCollectionInStaging(
       };
     }
 
+    // Fix 3A: Add image on update (same as create path)
+    if (collection.image) {
+      input.image = {
+        src: collection.image.url,
+        altText: collection.image.altText,
+      };
+    }
+
+    // Fix 3B: Add rule set for smart collections on update (same as create path)
+    if (
+      collection.ruleSet &&
+      collection.ruleSet.rules &&
+      collection.ruleSet.rules.length > 0
+    ) {
+      input.ruleSet = {
+        appliedDisjunctively: collection.ruleSet.appliedDisjunctively,
+        rules: collection.ruleSet.rules.map((rule) => ({
+          column: rule.column,
+          relation: rule.relation,
+          condition: rule.condition,
+        })),
+      };
+    }
+
     const variables = { input };
     const response = await stagingAdmin.graphql(mutation, { variables });
     const result = await response.json();
@@ -437,7 +507,7 @@ async function addProductsToCollection(collectionId, productIds, stagingAdmin) {
         collection {
           id
           title
-          productsCount
+          productsCount { count }
         }
         userErrors {
           field

@@ -178,8 +178,26 @@ export const action = async ({ request }) => {
   const syncType = formData.get("syncType");
   const connectionId = formData.get("connectionId");
 
+  // Fix 7A: Validate syncType against known values
+  const validSyncTypes = [
+    "metafield_definitions",
+    "metaobject_definitions",
+    "products",
+    "collections",
+    "locations",
+    "navigation",
+    "pages",
+    "files",
+    "markets",
+    "search_discovery",
+  ];
+  if (!syncType || !validSyncTypes.includes(syncType)) {
+    return { error: `Invalid sync type: "${syncType || "(none)"}". Valid types: ${validSyncTypes.join(", ")}` };
+  }
+
+  // Fix 7B: Show error when no connection is selected
   if (!connectionId) {
-    return { error: "Please select a connection" };
+    return { error: "Please select a store connection before syncing. Go to Settings to create one if needed." };
   }
 
   // Fetch connection with token
@@ -326,9 +344,11 @@ export const action = async ({ request }) => {
         })();
 
         // Return quickly; UI will poll /app/sync/status?logId=...
+        console.log("=== SYNC DEBUG === Products sync dispatched to background, logId:", syncLog.id);
         return {
           started: true,
           logId: syncLog.id,
+          syncType: "products",
           message:
             "Product sync started and is running in the background. You can close this window.",
         };
@@ -404,9 +424,11 @@ export const action = async ({ request }) => {
           }
         })();
 
+        console.log("=== SYNC DEBUG === Collections sync dispatched to background, logId:", syncLog.id);
         return {
           started: true,
           logId: syncLog.id,
+          syncType: "collections",
           message:
             "Collections sync started and is running in the background. You can close this window.",
         };
@@ -481,9 +503,11 @@ export const action = async ({ request }) => {
           }
         })();
 
+        console.log("=== SYNC DEBUG === Files sync dispatched to background, logId:", syncLog.id);
         return {
           started: true,
           logId: syncLog.id,
+          syncType: "files",
           message:
             "Files sync started and is running in the background. You can close this window.",
         };
@@ -617,7 +641,7 @@ export const action = async ({ request }) => {
       default:
         result = {
           success: false,
-          error: "Invalid sync type",
+          error: `Unhandled sync type: "${syncType}"`,
         };
     }
 
@@ -703,15 +727,8 @@ const SYNC_TYPES = [
     id: "files",
     label: "Theme Images",
     description:
-      "Sync images uploaded in theme editor (excludes product images)",
+      "Sync images uploaded in theme editor (excludes product images) - Formats accepted: PNG, JPG, SVG, WEBP",
     icon: ImageIcon,
-    available: true,
-  },
-  {
-    id: "navigation",
-    label: "Navigation Menus",
-    description: "Sync navigation menus and their structure",
-    icon: SettingsIcon,
     available: true,
   },
   {
@@ -719,6 +736,13 @@ const SYNC_TYPES = [
     label: "Pages",
     description: "Sync online store pages and their content",
     icon: ProfileIcon,
+    available: true,
+  },
+  {
+    id: "navigation",
+    label: "Navigation Menus",
+    description: "Sync navigation menus and their structure (pages should be synced first)",
+    icon: SettingsIcon,
     available: true,
   },
   {
@@ -789,6 +813,9 @@ export default function DataSync() {
   // Track previous navigation state for better sync detection
   const prevNavigationStateRef = useRef(navigation.state);
 
+  // Track if polling is active to prevent duplicate intervals
+  const pollingIntervalRef = useRef(null);
+
   // Auto-show logs when sync completes
   useEffect(() => {
     if (actionData?.logs && actionData?.success !== undefined) {
@@ -797,14 +824,31 @@ export default function DataSync() {
   }, [actionData]);
 
   // When a background job is started by the action, begin polling status
+  // BUT skip polling during bulk sync — let the chain handle progression
   useEffect(() => {
-    if (actionData?.started && actionData?.logId) {
+    if (actionData?.started && actionData?.logId && !isRunningBulkSync) {
+      console.log("New background sync started:", {
+        logId: actionData.logId,
+        syncType: actionData.syncType,
+      });
+
       setActiveLogId(actionData.logId);
-      setBackgroundStatus({ status: "in_progress" });
+      setBackgroundStatus({
+        status: "in_progress",
+        summary: {
+          progress: {
+            percentage: 0,
+            stage: "starting",
+            message: "Initializing sync...",
+          },
+        },
+      });
       // kick off an immediate load
       statusFetcher.load(`/app/sync/status?logId=${actionData.logId}`);
     }
-  }, [actionData, statusFetcher]);
+    // Only depend on actionData, not statusFetcher
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actionData, isRunningBulkSync]);
 
   // On initial page load, if there is an active sync from the loader, start polling it
   useEffect(() => {
@@ -824,41 +868,173 @@ export default function DataSync() {
       });
       statusFetcher.load(`/app/sync/status?logId=${log.id}`);
     }
-  }, [activeLogs, activeLogId, statusFetcher]);
+    // Only depend on activeLogs and activeLogId, not statusFetcher
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeLogs, activeLogId]);
 
-  // Poll every 3s while activeLogId is set and until completed
+  // Poll every 5s while activeLogId is set and until completed
   useEffect(() => {
-    if (!activeLogId) return;
-    const interval = setInterval(() => {
-      statusFetcher.load(`/app/sync/status?logId=${activeLogId}`);
-    }, 3000);
-    return () => clearInterval(interval);
-  }, [activeLogId, statusFetcher]);
+    if (!activeLogId) {
+      // Clear any existing interval when no active log
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Stop polling if we already have completion data
+    if (backgroundStatus?.completedAt) {
+      console.log("Sync completed, stopping polling");
+      setActiveLogId(null);
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Don't create duplicate intervals
+    if (pollingIntervalRef.current) {
+      console.log("Polling already active, skipping interval creation");
+      return;
+    }
+
+    console.log("Starting status polling for logId:", activeLogId);
+
+    pollingIntervalRef.current = setInterval(() => {
+      // Check if sync completed before polling
+      if (backgroundStatus?.completedAt) {
+        console.log("Sync completed during interval, clearing");
+        if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current);
+          pollingIntervalRef.current = null;
+        }
+        setActiveLogId(null);
+        setShowLogs(true);
+        return;
+      }
+
+      // Only trigger fetch if fetcher is idle (not already loading)
+      if (statusFetcher.state === "idle") {
+        console.log("Polling status for logId:", activeLogId);
+        statusFetcher.load(`/app/sync/status?logId=${activeLogId}`);
+      } else {
+        console.log("Skipping poll - fetcher is busy:", statusFetcher.state);
+      }
+    }, 5000); // Increased to 5 seconds to reduce request frequency
+
+    return () => {
+      console.log("Cleaning up polling interval");
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+    };
+    // Don't include statusFetcher in deps to prevent re-creating interval
+    // Don't include backgroundStatus to prevent re-creating interval on every status update
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeLogId]);
 
   // Track fetcher data for background progress/completion
+  // Use JSON stringify to detect actual content changes, not just reference changes
+  const statusDataString = statusFetcher.data
+    ? JSON.stringify(statusFetcher.data)
+    : null;
+
   useEffect(() => {
-    if (statusFetcher.data) {
-      setBackgroundStatus(statusFetcher.data);
-      if (statusFetcher.data.completedAt) {
-        // Show logs when job completes via polling
-        setShowLogs(true);
-      }
+    // Only process when fetcher has data
+    if (!statusFetcher.data) return;
+
+    // Handle error responses
+    if (statusFetcher.data.error) {
+      console.error("Status fetch error:", statusFetcher.data.error);
+      // Don't stop polling on errors, just log them
+      return;
     }
-  }, [statusFetcher.data]);
+
+    console.log("Updating background status:", {
+      status: statusFetcher.data.status,
+      progress: statusFetcher.data.summary?.progress,
+      completedAt: statusFetcher.data.completedAt,
+    });
+
+    // Update state with new data
+    setBackgroundStatus(statusFetcher.data);
+
+    if (statusFetcher.data.completedAt) {
+      console.log("Sync completed, stopping polling and showing logs", {
+        completedAt: statusFetcher.data.completedAt,
+        status: statusFetcher.data.status,
+      });
+
+      // Clear active log to stop polling FIRST
+      setActiveLogId(null);
+
+      // Clear the interval immediately
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+
+      // Then show logs
+      setShowLogs(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusDataString]);
+
+  // Reference to track bulk sync polling interval
+  const bulkSyncPollingRef = useRef(null);
+
+  // Helper: advance bulk sync to next type or finish
+  const advanceBulkSync = useCallback(() => {
+    if (currentSyncIndex < selectedSyncTypes.length - 1) {
+      const nextIndex = currentSyncIndex + 1;
+      const nextSyncType = selectedSyncTypes[nextIndex];
+
+      console.log(
+        `Moving to next sync: ${nextSyncType} (${nextIndex + 1}/${selectedSyncTypes.length})`,
+      );
+
+      setCurrentSyncIndex(nextIndex);
+      setSyncProgress({
+        current: nextIndex,
+        total: selectedSyncTypes.length,
+        currentSync: nextSyncType,
+        percentage: Math.round((nextIndex / selectedSyncTypes.length) * 100),
+      });
+
+      setTimeout(() => {
+        console.log(`Submitting next sync: ${nextSyncType}`);
+        const formData = new FormData();
+        formData.append("syncType", nextSyncType);
+        formData.append("connectionId", selectedConnection);
+        formData.append("isBulkSync", "true");
+        submit(formData, { method: "post" });
+      }, 1000);
+    } else {
+      console.log("All bulk syncs complete!");
+      setSyncProgress({
+        current: selectedSyncTypes.length,
+        total: selectedSyncTypes.length,
+        currentSync: selectedSyncTypes[selectedSyncTypes.length - 1],
+        percentage: 100,
+        complete: true,
+      });
+
+      setTimeout(() => {
+        setIsRunningBulkSync(false);
+        setSyncProgress(null);
+        setCurrentSyncIndex(0);
+        setSelectedSyncTypes([]);
+      }, 3000);
+    }
+  }, [currentSyncIndex, selectedSyncTypes, selectedConnection, submit]);
 
   // Handle bulk sync progress
   useEffect(() => {
     const prevState = prevNavigationStateRef.current;
     const currentState = navigation.state;
-
-    console.log("Bulk sync state check:", {
-      isRunningBulkSync,
-      prevNavigationState: prevState,
-      currentNavigationState: currentState,
-      currentSyncIndex,
-      totalSyncs: selectedSyncTypes.length,
-      hasActionData: !!actionData,
-    });
 
     // Detect when a sync has just completed (transition from submitting/loading to idle)
     const justCompleted =
@@ -869,65 +1045,74 @@ export default function DataSync() {
 
     if (justCompleted) {
       console.log(
-        `Sync completed. Current index: ${currentSyncIndex}, Total: ${selectedSyncTypes.length}`,
+        `Sync response received. Current index: ${currentSyncIndex}, Total: ${selectedSyncTypes.length}`,
       );
 
-      // Check if we have more syncs to run
-      if (currentSyncIndex < selectedSyncTypes.length - 1) {
-        // Move to next sync
-        const nextIndex = currentSyncIndex + 1;
-        const nextSyncType = selectedSyncTypes[nextIndex];
-
+      // Check if this was a background sync (products, collections, files)
+      if (actionData?.started && actionData?.logId) {
         console.log(
-          `Moving to next sync: ${nextSyncType} (${nextIndex + 1}/${selectedSyncTypes.length})`,
+          `Background sync started (logId: ${actionData.logId}). Polling until complete...`,
         );
 
-        // Update state for next sync
-        setCurrentSyncIndex(nextIndex);
-        setSyncProgress({
-          current: nextIndex,
-          total: selectedSyncTypes.length,
-          currentSync: nextSyncType,
-          percentage: Math.round((nextIndex / selectedSyncTypes.length) * 100),
-        });
+        const currentSyncType = selectedSyncTypes[currentSyncIndex];
+        setSyncProgress((prev) => ({
+          ...prev,
+          currentSync: currentSyncType,
+          message: `${currentSyncType} running in background...`,
+        }));
 
-        // Submit next sync with a small delay to ensure state updates
-        setTimeout(() => {
-          console.log(`Submitting next sync: ${nextSyncType}`);
-          const formData = new FormData();
-          formData.append("syncType", nextSyncType);
-          formData.append("connectionId", selectedConnection);
-          formData.append("isBulkSync", "true");
-          submit(formData, { method: "post" });
-        }, 1000); // Increased delay for more reliable execution
+        // Poll the status endpoint until the background sync completes
+        if (bulkSyncPollingRef.current) {
+          clearInterval(bulkSyncPollingRef.current);
+        }
+
+        const logId = actionData.logId;
+        bulkSyncPollingRef.current = setInterval(async () => {
+          try {
+            const response = await fetch(
+              `/app/sync/status?logId=${logId}`,
+              { credentials: "same-origin" },
+            );
+            const data = await response.json();
+
+            if (data.summary?.progress) {
+              setSyncProgress((prev) => ({
+                ...prev,
+                message: `${currentSyncType}: ${data.summary.progress.message || data.summary.progress.stage || "running..."}`,
+              }));
+            }
+
+            if (data.completedAt) {
+              console.log(
+                `Background sync ${currentSyncType} completed (logId: ${logId})`,
+              );
+              clearInterval(bulkSyncPollingRef.current);
+              bulkSyncPollingRef.current = null;
+              advanceBulkSync();
+            }
+          } catch (err) {
+            console.error("Bulk sync polling error:", err);
+          }
+        }, 5000);
       } else {
-        // All syncs complete
-        console.log("All bulk syncs complete!");
-        setSyncProgress({
-          current: selectedSyncTypes.length,
-          total: selectedSyncTypes.length,
-          currentSync: selectedSyncTypes[selectedSyncTypes.length - 1],
-          percentage: 100,
-          complete: true,
-        });
-
-        // Clear state after showing completion
-        setTimeout(() => {
-          setIsRunningBulkSync(false);
-          setSyncProgress(null);
-          setCurrentSyncIndex(0);
-          setSelectedSyncTypes([]);
-        }, 3000);
+        // Synchronous sync completed — advance immediately
+        advanceBulkSync();
       }
     }
+
+    return () => {
+      if (bulkSyncPollingRef.current) {
+        clearInterval(bulkSyncPollingRef.current);
+        bulkSyncPollingRef.current = null;
+      }
+    };
   }, [
     navigation.state,
     isRunningBulkSync,
     currentSyncIndex,
     selectedSyncTypes,
-    selectedConnection,
-    submit,
     actionData,
+    advanceBulkSync,
   ]);
 
   const handleTabChange = useCallback(
@@ -1082,36 +1267,68 @@ export default function DataSync() {
     >
       <Layout>
         {/* Background running banner/progress (products) */}
-        {activeLogId && backgroundStatus?.status === "in_progress" && (
-          <Layout.Section>
-            <Banner status="info" title="Sync is running in the background">
-              <BlockStack gap="200">
+        {activeLogId &&
+          backgroundStatus?.status === "in_progress" &&
+          !backgroundStatus?.completedAt && (
+            <Layout.Section key={statusDataString || activeLogId}>
+              <Banner status="info" title="Sync is running in the background">
+                <BlockStack gap="200">
+                  <Text variant="bodyMd">
+                    You can safely close this window; the sync continues in the
+                    background. Check the Sync History tab for updates.
+                  </Text>
+                  <ProgressBar
+                    progress={
+                      backgroundStatus?.summary?.progress?.percentage ??
+                      backgroundStatus?.summary?.percentage ??
+                      0
+                    }
+                    size="small"
+                  />
+                  {backgroundStatus?.summary?.progress?.message && (
+                    <Text
+                      variant="bodySm"
+                      color="subdued"
+                      key={backgroundStatus.summary.progress.message}
+                    >
+                      {backgroundStatus.summary.progress.message}
+                    </Text>
+                  )}
+                  {backgroundStatus?.summary?.progress?.stage && (
+                    <Text
+                      variant="bodySm"
+                      color="subdued"
+                      key={backgroundStatus.summary.progress.stage}
+                    >
+                      Stage: {backgroundStatus.summary.progress.stage}
+                    </Text>
+                  )}
+                </BlockStack>
+              </Banner>
+            </Layout.Section>
+          )}
+        {/* Show warning when status fetcher has network errors */}
+        {activeLogId &&
+          statusFetcher.state === "idle" &&
+          statusFetcher.data?.error && (
+            <Layout.Section>
+              <Banner
+                status="warning"
+                title="Status update temporarily unavailable"
+              >
                 <Text variant="bodyMd">
-                  You can safely close this window; the sync continues in the
-                  background. Check the Sync History tab for updates.
+                  Unable to fetch sync status updates. The sync is still running
+                  in the background.
+                  {statusFetcher.data.details && (
+                    <Text variant="bodySm" color="subdued">
+                      {" "}
+                      Details: {statusFetcher.data.details}
+                    </Text>
+                  )}
                 </Text>
-                <ProgressBar
-                  progress={
-                    backgroundStatus?.summary?.progress?.percentage ??
-                    backgroundStatus?.summary?.percentage ??
-                    0
-                  }
-                  size="small"
-                />
-                {backgroundStatus?.summary?.progress?.message && (
-                  <Text variant="bodySm" color="subdued">
-                    {backgroundStatus.summary.progress.message}
-                  </Text>
-                )}
-                {backgroundStatus?.summary?.progress?.stage && (
-                  <Text variant="bodySm" color="subdued">
-                    Stage: {backgroundStatus.summary.progress.stage}
-                  </Text>
-                )}
-              </BlockStack>
-            </Banner>
-          </Layout.Section>
-        )}
+              </Banner>
+            </Layout.Section>
+          )}
         {actionData?.error && (
           <Layout.Section>
             <Banner

@@ -19,7 +19,7 @@ export default function App() {
   return (
     <div className={styles.index}>
       <div className={styles.content}>
-        <h1 className={styles.heading}>Store Data Sync Tool</h1>
+        <h1 className={styles.heading}>StageSync</h1>
         <p className={styles.text}>
           Seamlessly sync data between your production and staging Shopify
           stores
@@ -95,7 +95,8 @@ export default function App() {
               read_metaobject_definitions, read_metaobjects, read_products,
               read_files, read_online_store_navigation, read_online_store_pages,
               read_markets, read_companies, read_customers, read_locales,
-              read_product_listings, read_locations
+              read_product_listings, read_locations, read_inventory,
+              write_inventory
             </code>
           </div>
 

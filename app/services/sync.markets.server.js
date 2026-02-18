@@ -109,25 +109,68 @@ async function getProductionMarketCatalog(
  * Resolve product IDs in staging by handles.
  */
 async function resolveStagingProductIdsByHandles(stagingAdmin, handles) {
+  if (!handles || handles.length === 0) return [];
+
   const ids = [];
-  for (const handle of handles) {
-    const q = `
-      query($handle: String!) {
-        product: productByIdentifier(identifier:{ handle: $handle }) { id }
-      }
-    `;
+  const BATCH_SIZE = 50;
+
+  // Process handles in batches using GraphQL aliases
+  for (let i = 0; i < handles.length; i += BATCH_SIZE) {
+    const batch = handles.slice(i, i + BATCH_SIZE);
+
+    // Build aliased query: p0: productByIdentifier(...) { id }, p1: ...
+    const fragments = batch
+      .map(
+        (handle, idx) =>
+          `p${idx}: productByIdentifier(identifier: { handle: "${handle.replace(/"/g, '\\"')}" }) { id }`,
+      )
+      .join("\n      ");
+
+    const query = `query { ${fragments} }`;
+
     try {
-      const resp = await stagingAdmin.graphql(q, { variables: { handle } });
+      const resp = await stagingAdmin.graphql(query);
       const json = await resp.json();
-      const id = json.data?.product?.id;
-      if (id) ids.push(id);
+
+      if (json.errors) {
+        console.warn(
+          `[MARKETS DEBUG] Batch resolve errors:`,
+          json.errors.map((e) => e.message).join(", "),
+        );
+      }
+
+      // Extract IDs from aliased results
+      for (let idx = 0; idx < batch.length; idx++) {
+        const id = json.data?.[`p${idx}`]?.id;
+        if (id) ids.push(id);
+      }
     } catch (e) {
       console.warn(
-        `[MARKETS DEBUG] Failed to resolve handle ${handle}:`,
+        `[MARKETS DEBUG] Batch resolve failed, falling back to individual queries:`,
         e.message,
       );
+      // Fallback: resolve individually for this batch
+      for (const handle of batch) {
+        const q = `
+          query($handle: String!) {
+            product: productByIdentifier(identifier:{ handle: $handle }) { id }
+          }
+        `;
+        try {
+          const resp = await stagingAdmin.graphql(q, { variables: { handle } });
+          const json = await resp.json();
+          const id = json.data?.product?.id;
+          if (id) ids.push(id);
+        } catch (innerErr) {
+          console.warn(
+            `[MARKETS DEBUG] Failed to resolve handle ${handle}:`,
+            innerErr.message,
+          );
+        }
+      }
     }
   }
+
   return ids;
 }
 

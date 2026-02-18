@@ -117,8 +117,8 @@ async function getMetafieldDefinitions(ownerType, store, token) {
 // Get existing metafield definitions in staging
 async function getExistingStagingDefinitions(ownerType, stagingAdmin) {
   const query = `
-    query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!) {
-      metafieldDefinitions(ownerType: $ownerType, first: 250) {
+    query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!, $after: String) {
+      metafieldDefinitions(ownerType: $ownerType, first: 250, after: $after) {
         edges {
           node {
             id
@@ -129,25 +129,41 @@ async function getExistingStagingDefinitions(ownerType, stagingAdmin) {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
   try {
-    const response = await stagingAdmin.graphql(query, {
-      variables: { ownerType },
-    });
+    const allDefinitions = [];
+    let hasNextPage = true;
+    let cursor = null;
 
-    const data = await response.json();
-    console.log("Staging definitions response:", JSON.stringify(data, null, 2));
+    while (hasNextPage) {
+      const response = await stagingAdmin.graphql(query, {
+        variables: { ownerType, after: cursor },
+      });
 
-    if (data.errors) {
-      throw new Error(
-        `GraphQL errors: ${data.errors.map((e) => e.message).join(", ")}`,
-      );
+      const data = await response.json();
+      console.log("Staging definitions response:", JSON.stringify(data, null, 2));
+
+      if (data.errors) {
+        throw new Error(
+          `GraphQL errors: ${data.errors.map((e) => e.message).join(", ")}`,
+        );
+      }
+
+      const edges = data.data.metafieldDefinitions.edges || [];
+      allDefinitions.push(...edges.map((edge) => edge.node));
+
+      hasNextPage = data.data.metafieldDefinitions.pageInfo?.hasNextPage || false;
+      cursor = data.data.metafieldDefinitions.pageInfo?.endCursor || null;
     }
 
-    return data.data.metafieldDefinitions.edges.map((edge) => edge.node);
+    return allDefinitions;
   } catch (error) {
     console.error("Error fetching staging definitions:", error);
     return [];
@@ -709,7 +725,7 @@ export async function syncMetafieldDefinitions(
 
       try {
         const prodMetaobjectResponse = await fetch(
-          `https://${productionStore}/admin/api/2025-01/graphql.json`,
+          `https://${productionStore}/admin/api/2025-07/graphql.json`,
           {
             method: "POST",
             headers: {
@@ -896,8 +912,8 @@ export async function syncMetafieldDefinitions(
  */
 async function checkMetafieldDefinitions(ownerType, metafields, stagingAdmin) {
   const query = `
-    query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!) {
-      metafieldDefinitions(ownerType: $ownerType, first: 250) {
+    query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!, $after: String) {
+      metafieldDefinitions(ownerType: $ownerType, first: 250, after: $after) {
         edges {
           node {
             namespace
@@ -907,18 +923,31 @@ async function checkMetafieldDefinitions(ownerType, metafields, stagingAdmin) {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
   `;
 
   try {
-    const response = await stagingAdmin.graphql(query, {
-      variables: { ownerType },
-    });
-    const result = await response.json();
+    const definitions = [];
+    let hasNextPage = true;
+    let cursor = null;
 
-    const definitions =
-      result.data?.metafieldDefinitions?.edges?.map((e) => e.node) || [];
+    while (hasNextPage) {
+      const response = await stagingAdmin.graphql(query, {
+        variables: { ownerType, after: cursor },
+      });
+      const result = await response.json();
+
+      const edges = result.data?.metafieldDefinitions?.edges || [];
+      definitions.push(...edges.map((e) => e.node));
+
+      hasNextPage = result.data?.metafieldDefinitions?.pageInfo?.hasNextPage || false;
+      cursor = result.data?.metafieldDefinitions?.pageInfo?.endCursor || null;
+    }
     const definitionMap = new Map();
 
     definitions.forEach((def) => {
@@ -1039,6 +1068,21 @@ export async function syncMetafieldValues(
         }
       }
     `,
+    COLLECTION: `
+      query getMetafields($ownerId: ID!) {
+        collection(id: $ownerId) {
+          metafields(first: 50) {
+            nodes {
+              id
+              namespace
+              key
+              value
+              type
+            }
+          }
+        }
+      }
+    `,
   };
 
   const query = ownerTypeQueries[ownerType];
@@ -1066,6 +1110,7 @@ export async function syncMetafieldValues(
       MARKET: "market",
       PRODUCT: "product",
       PRODUCTVARIANT: "productVariant",
+      COLLECTION: "collection",
     };
     const dataPath = dataPathMap[ownerType] || ownerType.toLowerCase();
     const existingMetafields =
@@ -1116,8 +1161,11 @@ export async function syncMetafieldValues(
           type: metafield.type,
         };
 
+        const valuePreview = typeof metafield.value === "string"
+          ? metafield.value.substring(0, 50)
+          : String(metafield.value ?? "");
         console.log(
-          `Processing metafield ${metafield.namespace}.${metafield.key} with value: ${metafield.value.substring(0, 50)}...`,
+          `Processing metafield ${metafield.namespace}.${metafield.key} with value: ${valuePreview}...`,
         );
 
         if (existingMetafield) {

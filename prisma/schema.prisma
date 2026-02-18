@@ -46,6 +46,7 @@ model StoreConnection {
   syncLogs           SyncLog[]
   resourceMappings   ResourceMapping[]
   unmappedReferences UnmappedReference[]
+  syncSchedule       SyncSchedule?
 
   @@unique([shop, storeDomain])
   @@index([shop])
@@ -111,4 +112,28 @@ model UnmappedReference {
   @@unique([storeConnectionId, productionGid, context])
   @@index([storeConnectionId, resolved])
   @@index([resourceType, resolved])
+}
+
+// Schedule configuration for automated syncs
+model SyncSchedule {
+  id              String    @id @default(cuid())
+  shop            String
+  connectionId    String    @unique
+  syncTypes       String    // JSON array of sync types to run, e.g. ["products","collections"]
+  frequency       String    @default("daily") // daily, every_12h, every_6h, weekly
+  hour            Int       @default(2) // Hour of day to run (0-23, UTC)
+  minute          Int       @default(0) // Minute of hour to run (0-59)
+  dayOfWeek       Int?      // Day of week for weekly frequency (0=Sun, 6=Sat)
+  enabled         Boolean   @default(true)
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  lastRunStatus   String?   // success, partial, failed
+  lastRunSummary  String?   // JSON summary of last run
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  connection      StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([enabled])
+  @@index([shop])
 }

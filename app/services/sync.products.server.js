@@ -43,9 +43,13 @@ async function retryOperation(operation, maxRetries = 3, delay = 1000) {
 }
 
 /**
- * Resolve a publication ID by name (e.g., "Online Store").
+ * Fetch all available publications (sales channels) in the staging store.
+ * Caches the result per sync run to avoid repeated API calls.
  */
-async function getPublicationIdByName(name, stagingAdmin) {
+let _cachedPublications = null;
+async function getAllStagingPublications(stagingAdmin) {
+  if (_cachedPublications) return _cachedPublications;
+
   const query = `
     query GetPublications($first: Int!) {
       publications(first: $first) { nodes { id name } }
@@ -53,186 +57,83 @@ async function getPublicationIdByName(name, stagingAdmin) {
   `;
   try {
     const response = await stagingAdmin.graphql(query, {
-      variables: { first: 20 },
+      variables: { first: 50 },
     });
     const result = await response.json();
-    console.log(
-      "[PUBLISH DEBUG] Publications fetched:",
-      (result.data?.publications?.nodes || [])
-        .map((p) => `${p.name}:${p.id}`)
-        .join(", "),
-    );
     const nodes = result.data?.publications?.nodes || [];
-    const pub = nodes.find((p) => p?.name === name);
-    if (!pub) {
-      console.warn(
-        `[PUBLISH DEBUG] Publication "${name}" not found among:`,
-        nodes.map((p) => p.name).join(", ") || "<none>",
-      );
-    } else {
-      console.log(
-        `[PUBLISH DEBUG] Using publication "${pub.name}" (${pub.id})`,
-      );
-    }
-    return pub?.id || null;
+    console.log(
+      `[PUBLISH] Found ${nodes.length} publications: ${nodes.map((p) => p.name).join(", ")}`,
+    );
+    _cachedPublications = nodes;
+    return nodes;
   } catch (e) {
-    console.warn("Failed to fetch publications:", e.message);
-    return null;
+    console.warn("[PUBLISH] Failed to fetch publications:", e.message);
+    return [];
   }
 }
 
 /**
- * Explicitly publish a product to the Online Store publication using publishablePublish.
+ * Reset the publications cache (call at the start of each sync run).
  */
-async function publishProductToOnlineStore(productId, stagingAdmin) {
-  const publicationId = await getPublicationIdByName(
-    "Online Store",
-    stagingAdmin,
-  );
-  if (!publicationId) {
-    return { success: false, error: "Online Store publication not found" };
+function resetPublicationsCache() {
+  _cachedPublications = null;
+}
+
+/**
+ * Publish a product to ALL available sales channels in the staging store.
+ * Uses a single publishablePublish mutation with all publication IDs.
+ * Requires write_publications scope and product status ACTIVE for storefront visibility.
+ */
+async function publishProductToAllChannels(productId, stagingAdmin) {
+  const publications = await getAllStagingPublications(stagingAdmin);
+  if (publications.length === 0) {
+    return { success: false, error: "No publications found in staging store" };
   }
 
   const mutation = `
-    mutation Publish($id: ID!, $publicationId: ID!) {
-      publishablePublish(id: $id, input: { publicationId: $publicationId }) {
-        publishable { publishedOnPublication(publicationId: $publicationId) }
+    mutation PublishToAll($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        publishable {
+          ... on Product {
+            id
+          }
+        }
         userErrors { field message }
       }
     }
   `;
 
+  const input = publications.map((pub) => ({ publicationId: pub.id }));
+
   try {
     const response = await stagingAdmin.graphql(mutation, {
-      variables: { id: productId, publicationId },
+      variables: { id: productId, input },
     });
     const result = await response.json();
-    console.log(
-      `[PUBLISH DEBUG] publishablePublish result for ${productId}:`,
-      JSON.stringify(result, null, 2),
-    );
 
     if (result.errors) {
       const msg = result.errors.map((e) => e.message).join(", ");
-      console.warn(
-        `Product publish (explicit) errors for ${productId}: ${msg}`,
-      );
+      console.warn(`[PUBLISH] Errors for ${productId}: ${msg}`);
       return { success: false, error: msg };
     }
 
     const errs = result.data?.publishablePublish?.userErrors || [];
     if (errs.length > 0) {
       const msg = errs.map((e) => e.message).join(", ");
-      console.warn(
-        `Product publish (explicit) userErrors for ${productId}: ${msg}`,
-      );
+      console.warn(`[PUBLISH] userErrors for ${productId}: ${msg}`);
       return { success: false, error: msg };
     }
 
     console.log(
-      `📣 Published product ${productId} to Online Store (publication: ${publicationId})`,
+      `📣 Published product ${productId} to ${publications.length} channels`,
     );
-    return { success: true };
+    return { success: true, channelCount: publications.length };
   } catch (e) {
     console.warn(
-      `Failed to publish product ${productId} to Online Store:`,
+      `[PUBLISH] Failed to publish product ${productId}:`,
       e.message,
     );
     return { success: false, error: e.message };
-  }
-}
-
-/**
- * Publish a product. First attempts to publish to the "current channel"; if that fails
- * or doesn't result in a published state, falls back to explicitly publishing to Online Store.
- * Requires write_publications scope and product status ACTIVE for storefront visibility.
- */
-async function publishProductToCurrentChannel(productId, stagingAdmin) {
-  // Debug: log requested scopes (env) and granted scopes and product status
-  try {
-    console.log("[PUBLISH DEBUG] SCOPES env:", process.env.SCOPES);
-    const scopesQuery = `
-      query { currentAppInstallation { accessScopes { handle } } }
-    `;
-    const scopesResp = await stagingAdmin.graphql(scopesQuery);
-    const scopesJson = await scopesResp.json();
-    const handles = scopesJson.data?.currentAppInstallation?.accessScopes?.map(
-      (s) => s.handle,
-    );
-    console.log(
-      "[PUBLISH DEBUG] Granted scopes:",
-      Array.isArray(handles) ? handles.join(", ") : handles,
-    );
-  } catch (e) {
-    console.warn("[PUBLISH DEBUG] Failed to query granted scopes:", e.message);
-  }
-
-  try {
-    const statusQuery = `
-      query($id: ID!) { product(id: $id) { id title handle status } }
-    `;
-    const statusResp = await stagingAdmin.graphql(statusQuery, {
-      variables: { id: productId },
-    });
-    const statusJson = await statusResp.json();
-    console.log(
-      "[PUBLISH DEBUG] Product before publish:",
-      statusJson.data?.product,
-    );
-  } catch (e) {
-    console.warn("[PUBLISH DEBUG] Failed to read product status:", e.message);
-  }
-  const mutation = `
-    mutation publishToCurrent($id: ID!) {
-      publishablePublishToCurrentChannel(id: $id) {
-        publishable { publishedOnCurrentPublication }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  try {
-    const response = await stagingAdmin.graphql(mutation, {
-      variables: { id: productId },
-    });
-    const result = await response.json();
-    console.log(
-      `[PUBLISH DEBUG] publishablePublishToCurrentChannel result for ${productId}:`,
-      JSON.stringify(result, null, 2),
-    );
-
-    if (result.errors) {
-      const msg = result.errors.map((e) => e.message).join(", ");
-      console.warn(`Product publish errors for ${productId}: ${msg}`);
-      // Fallback to explicit Online Store publication
-      return await publishProductToOnlineStore(productId, stagingAdmin);
-    }
-
-    const userErrors =
-      result.data?.publishablePublishToCurrentChannel?.userErrors || [];
-    const published =
-      !!result.data?.publishablePublishToCurrentChannel?.publishable
-        ?.publishedOnCurrentPublication;
-
-    if (userErrors.length > 0 || !published) {
-      if (userErrors.length > 0) {
-        const msg = userErrors.map((e) => e.message).join(", ");
-        console.warn(`Product publish userErrors for ${productId}: ${msg}`);
-      } else {
-        console.warn(
-          `Product ${productId} not marked published on current publication; falling back.`,
-        );
-      }
-      // Fallback to explicit Online Store publication
-      return await publishProductToOnlineStore(productId, stagingAdmin);
-    }
-
-    console.log(`📣 Published product ${productId} to current channel`);
-    return { success: true };
-  } catch (e) {
-    console.warn(`Failed to publish product ${productId}:`, e.message);
-    // Fallback to explicit Online Store publication
-    return await publishProductToOnlineStore(productId, stagingAdmin);
   }
 }
 
@@ -267,6 +168,11 @@ async function getProductionProducts(productionStore, accessToken, first = 5) {
             description
             descriptionHtml
             productType
+            category {
+              id
+              name
+              fullName
+            }
             status
             tags
             vendor
@@ -508,13 +414,13 @@ async function getProductionProducts(productionStore, accessToken, first = 5) {
  */
 async function getStagingProductByHandle(handle, stagingAdmin) {
   const query = `
-    query GetProductByHandle($handle: String!) {
+    query GetProductByHandle($handle: String!, $variantsAfter: String) {
       product: productByIdentifier (identifier: { handle: $handle }){
         id
         handle
         title
         status
-        variants(first: 100) {
+        variants(first: 100, after: $variantsAfter) {
           edges {
             node {
               id
@@ -530,13 +436,17 @@ async function getStagingProductByHandle(handle, stagingAdmin) {
               }
             }
           }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
       }
     }
   `;
 
   try {
-    const variables = { handle };
+    const variables = { handle, variantsAfter: null };
     const response = await stagingAdmin.graphql(query, { variables });
     const result = await response.json();
 
@@ -545,7 +455,34 @@ async function getStagingProductByHandle(handle, stagingAdmin) {
       return null;
     }
 
-    return result.data?.product || null;
+    const product = result.data?.product;
+    if (!product) return null;
+
+    // Paginate through remaining variants if needed
+    let hasNextPage = product.variants?.pageInfo?.hasNextPage || false;
+    let cursor = product.variants?.pageInfo?.endCursor || null;
+    const allVariantEdges = [...(product.variants?.edges || [])];
+
+    while (hasNextPage) {
+      const nextResp = await stagingAdmin.graphql(query, {
+        variables: { handle, variantsAfter: cursor },
+      });
+      const nextResult = await nextResp.json();
+      const nextProduct = nextResult.data?.product;
+      if (!nextProduct) break;
+
+      const edges = nextProduct.variants?.edges || [];
+      allVariantEdges.push(...edges);
+
+      hasNextPage = nextProduct.variants?.pageInfo?.hasNextPage || false;
+      cursor = nextProduct.variants?.pageInfo?.endCursor || null;
+    }
+
+    // Return product with all variants
+    return {
+      ...product,
+      variants: { edges: allVariantEdges },
+    };
   } catch (error) {
     console.error("Error getting staging product by handle:", error);
     return null;
@@ -903,23 +840,63 @@ async function syncVariantInventory(
       );
       console.log(`  Staging location ID: ${stagingLocationId}`);
 
-      // Set inventory quantity using inventorySetQuantities mutation
-      // This mutation works for both initial setup and updates (unlike inventoryActivate which is deprecated for updates)
-      const mutation = `
-        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
-          inventorySetQuantities(input: $input) {
-            inventoryAdjustmentGroup {
-              createdAt
-              reason
-              referenceDocumentUri
-              changes {
+      // Check current quantity first to avoid unnecessary updates
+      let shouldUpdate = true;
+      try {
+        const checkQuery = `
+          query checkInventory($inventoryItemId: ID!, $locationId: ID!) {
+            inventoryLevel(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+              quantities(names: "available") {
                 name
-                delta
-                quantityAfterChange
+                quantity
               }
             }
+          }
+        `;
+        const checkResp = await stagingAdmin.graphql(checkQuery, {
+          variables: {
+            inventoryItemId: stagingVariant.inventoryItem.id,
+            locationId: stagingLocationId,
+          },
+        });
+        const checkResult = await checkResp.json();
+        const currentQty =
+          checkResult.data?.inventoryLevel?.quantities?.find(
+            (q) => q.name === "available",
+          )?.quantity ?? null;
+
+        if (currentQty === availableQty) {
+          console.log(
+            `  ⏭️  Inventory already correct (${currentQty} units), skipping`,
+          );
+          results.synced.push({
+            location: prodLevel.location.name,
+            sku: prodVariant.sku || "[NO SKU]",
+            quantity: currentQty,
+          });
+          shouldUpdate = false;
+        } else {
+          console.log(
+            `  Current: ${currentQty ?? "not stocked"}, Target: ${availableQty}`,
+          );
+        }
+      } catch (e) {
+        // Item not stocked yet, proceed with activation
+        console.log(`  Item not stocked at location yet, will activate`);
+      }
+
+      if (!shouldUpdate) {
+        continue;
+      }
+
+      // Step 1: Ensure the item is activated at the location (without setting quantity)
+      const activateMutation = `
+        mutation inventoryActivate($inventoryItemId: ID!, $locationId: ID!) {
+          inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+            inventoryLevel {
+              id
+            }
             userErrors {
-              code
               field
               message
             }
@@ -927,36 +904,75 @@ async function syncVariantInventory(
         }
       `;
 
-      const variables = {
-        input: {
-          ignoreCompareQuantity: true, // Ignore compare-and-swap to prevent concurrent update issues during sync
-          name: "available",
-          reason: "correction",
-          referenceDocumentUri: `gid://staging-sync/InventorySync/${new Date().toISOString()}`,
-          quantities: [
-            {
+      try {
+        console.log(
+          `  Ensuring inventory is activated at location...`,
+        );
+        const activateResult = await retryOperation(async () => {
+          const resp = await stagingAdmin.graphql(activateMutation, {
+            variables: {
               inventoryItemId: stagingVariant.inventoryItem.id,
               locationId: stagingLocationId,
-              quantity: availableQty,
             },
-          ],
-        },
-      };
+          });
+          return await resp.json();
+        });
 
-      try {
-        console.log(`  Sending inventorySetQuantities mutation...`);
-        const response = await stagingAdmin.graphql(mutation, { variables });
-        const result = await response.json();
+        const activateErrors = activateResult.data?.inventoryActivate?.userErrors || [];
+        // Ignore "already active" style errors — that's fine, we just need it active
+        if (activateResult.errors) {
+          console.warn(`  ⚠️ Activation GraphQL errors (proceeding anyway):`, activateResult.errors.map(e => e.message).join(", "));
+        } else if (activateErrors.length > 0) {
+          console.log(`  ℹ️ Activation note: ${activateErrors.map(e => e.message).join(", ")}`);
+        } else {
+          console.log(`  ✅ Inventory activated at location`);
+        }
 
-        // Log the full response for debugging
-        console.log(`  Response status: ${response.status || "unknown"}`);
+        // Step 2: Set the quantity using inventorySetQuantities (works for both new and existing stock)
+        const setQuantitiesMutation = `
+          mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+            inventorySetQuantities(input: $input) {
+              inventoryAdjustmentGroup {
+                createdAt
+                reason
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `;
+
+        console.log(
+          `  Setting inventory quantity to ${availableQty}...`,
+        );
+        const setResult = await retryOperation(async () => {
+          const resp = await stagingAdmin.graphql(setQuantitiesMutation, {
+            variables: {
+              input: {
+                name: "available",
+                reason: "correction",
+                ignoreCompareQuantity: true,
+                quantities: [
+                  {
+                    inventoryItemId: stagingVariant.inventoryItem.id,
+                    locationId: stagingLocationId,
+                    quantity: availableQty,
+                  },
+                ],
+              },
+            },
+          });
+          return await resp.json();
+        });
 
         if (
-          result.errors ||
-          result.data?.inventorySetQuantities?.userErrors?.length > 0
+          setResult.errors ||
+          setResult.data?.inventorySetQuantities?.userErrors?.length > 0
         ) {
           const errors =
-            result.errors || result.data.inventorySetQuantities.userErrors;
+            setResult.errors || setResult.data.inventorySetQuantities.userErrors;
           console.error(
             `❌ Failed to set inventory for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}:`,
           );
@@ -967,131 +983,24 @@ async function syncVariantInventory(
             errors: errors.map((e) => e.message || e.code || JSON.stringify(e)),
           });
           results.success = false;
-        } else if (
-          !result.data?.inventorySetQuantities?.inventoryAdjustmentGroup
-        ) {
-          // inventoryAdjustmentGroup is null - try activating first, then setting quantity
-          console.warn(
-            `⚠️  inventoryAdjustmentGroup is null for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}`,
-          );
-          console.log(
-            `  Attempting to activate inventory item at location first...`,
-          );
-
-          try {
-            // First, activate the inventory at the location (without setting quantity)
-            const activateMutation = `
-              mutation inventoryActivate($inventoryItemId: ID!, $locationId: ID!) {
-                inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
-                  inventoryLevel { id }
-                  userErrors { field message }
-                }
-              }
-            `;
-
-            const activateVars = {
-              inventoryItemId: stagingVariant.inventoryItem.id,
-              locationId: stagingLocationId,
-            };
-
-            const activateResponse = await stagingAdmin.graphql(
-              activateMutation,
-              { variables: activateVars },
-            );
-            const activateResult = await activateResponse.json();
-
-            if (
-              activateResult.errors ||
-              activateResult.data?.inventoryActivate?.userErrors?.length > 0
-            ) {
-              const activateErrors =
-                activateResult.errors ||
-                activateResult.data.inventoryActivate.userErrors;
-              console.error(`  Failed to activate:`, activateErrors);
-              results.failed.push({
-                location: prodLevel.location.name,
-                sku: prodVariant.sku || "[NO SKU]",
-                errors: [
-                  "Failed to activate inventory",
-                  ...activateErrors.map((e) => e.message || e),
-                ],
-              });
-              results.success = false;
-            } else {
-              console.log(`  ✅ Activated inventory, now setting quantity...`);
-              // Now try setting quantity again
-              const retryResponse = await stagingAdmin.graphql(mutation, {
-                variables,
-              });
-              const retryResult = await retryResponse.json();
-
-              if (
-                retryResult.errors ||
-                retryResult.data?.inventorySetQuantities?.userErrors?.length >
-                  0 ||
-                !retryResult.data?.inventorySetQuantities
-                  ?.inventoryAdjustmentGroup
-              ) {
-                const retryErrors = retryResult.errors ||
-                  retryResult.data?.inventorySetQuantities?.userErrors || [
-                    "Still null after activation",
-                  ];
-                console.error(
-                  `  Failed to set quantity after activation:`,
-                  retryErrors,
-                );
-                results.failed.push({
-                  location: prodLevel.location.name,
-                  sku: prodVariant.sku || "[NO SKU]",
-                  errors: retryErrors.map(
-                    (e) => e.message || e.code || JSON.stringify(e),
-                  ),
-                });
-                results.success = false;
-              } else {
-                const changes =
-                  retryResult.data.inventorySetQuantities
-                    .inventoryAdjustmentGroup.changes;
-                const availableChange = changes.find(
-                  (c) => c.name === "available",
-                );
-                console.log(
-                  `✅ Set inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units (delta: ${availableChange?.delta || 0}) after activation`,
-                );
-                results.synced.push({
-                  location: prodLevel.location.name,
-                  sku: prodVariant.sku || "[NO SKU]",
-                  quantity: availableQty,
-                });
-              }
-            }
-          } catch (activateError) {
-            console.error(`  Error during activation attempt:`, activateError);
-            results.failed.push({
-              location: prodLevel.location.name,
-              sku: prodVariant.sku || "[NO SKU]",
-              errors: [`Activation attempt failed: ${activateError.message}`],
-            });
-            results.success = false;
-          }
         } else {
-          const changes =
-            result.data.inventorySetQuantities.inventoryAdjustmentGroup.changes;
-          const availableChange = changes.find((c) => c.name === "available");
           console.log(
-            `✅ Set inventory for ${prodVariant.sku} at ${prodLevel.location.name}: ${availableQty} units (delta: ${availableChange?.delta || 0})`,
+            `✅ Set inventory for ${prodVariant.sku || "[NO SKU]"} at ${prodLevel.location.name}: ${availableQty} units`,
           );
           results.synced.push({
             location: prodLevel.location.name,
-            sku: prodVariant.sku,
+            sku: prodVariant.sku || "[NO SKU]",
             quantity: availableQty,
           });
+
+          // Note: Only set "available" quantity. Setting "on_hand" separately
+          // would inflate available on staging (which has no committed orders).
         }
       } catch (error) {
-        console.error(`Error setting inventory for ${prodVariant.sku}:`, error);
+        console.error(`Error setting inventory for ${prodVariant.sku || "[NO SKU]"}:`, error);
         results.failed.push({
           location: prodLevel.location.name,
-          sku: prodVariant.sku,
+          sku: prodVariant.sku || "[NO SKU]",
           error: error.message,
         });
         results.success = false;
@@ -1413,6 +1322,9 @@ async function createProductInStaging(product, stagingAdmin) {
                 title
                 sku
                 price
+                inventoryItem {
+                  id
+                }
                 selectedOptions {
                   name
                   value
@@ -1447,6 +1359,14 @@ async function createProductInStaging(product, stagingAdmin) {
         title: product.seo.title,
         description: product.seo.description,
       };
+    }
+
+    // Set product category if present (uses new `category` field, not deprecated `productCategory`)
+    if (product.category?.id) {
+      input.category = product.category.id;
+      console.log(
+        `  Setting product category: ${product.category.fullName || product.category.name} (${product.category.id})`,
+      );
     }
 
     // Add product options
@@ -1519,20 +1439,13 @@ async function createProductInStaging(product, stagingAdmin) {
         console.log(`  Variant ${i + 1}: ${v.title} (SKU: ${v.sku})`);
       });
 
-      // Check if this is a simple product with no real options
-      const isSimpleProduct =
-        variants.length === 1 &&
-        variants[0].title === "Default Title" &&
-        product.options?.length === 1 &&
-        product.options[0].name === "Title";
-
-      if (!isSimpleProduct) {
+      {
         // Get the staging variants that were auto-created (should be only 1)
         const stagingVariants =
           createdProduct.variants?.edges?.map((e) => e.node) || [];
 
         console.log(
-          `Found ${stagingVariants.length} auto-created variant(s) in staging (expected 1)`,
+          `Found ${stagingVariants.length} auto-created variant(s) in staging (expected ${variants.length})`,
         );
 
         // Shopify only creates the first variant when using productOptions
@@ -1627,10 +1540,6 @@ async function createProductInStaging(product, stagingAdmin) {
             );
           }
         }
-      } else {
-        console.log(
-          `Skipping variant creation for "${product.title}" - simple product with default variant`,
-        );
       }
     }
 
@@ -1718,6 +1627,14 @@ async function updateProductInStaging(productId, product, stagingAdmin) {
         title: product.seo.title,
         description: product.seo.description,
       };
+    }
+
+    // Set product category if present (uses new `category` field, not deprecated `productCategory`)
+    if (product.category?.id) {
+      input.category = product.category.id;
+      console.log(
+        `  Setting product category: ${product.category.fullName || product.category.name} (${product.category.id})`,
+      );
     }
 
     const variables = { input };
@@ -1827,6 +1744,9 @@ export async function syncProducts(
     },
   };
   let locationMap = new Map();
+
+  // Reset publications cache for each sync run
+  resetPublicationsCache();
 
   // Create production admin client for API calls
   const productionAdmin = {
@@ -2103,8 +2023,8 @@ export async function syncProducts(
             }
           }
 
-          // Ensure product is published on the current channel
-          await publishProductToCurrentChannel(
+          // Publish product to all available sales channels
+          await publishProductToAllChannels(
             existingProduct.id,
             stagingAdmin,
           );
@@ -2151,10 +2071,44 @@ export async function syncProducts(
             }
           }
 
+          // Update variant data (tracked, SKU, price, etc.) for existing products
+          if (product.variants?.edges && existingProduct.variants?.edges) {
+            const productionVariants = product.variants.edges.map((e) => e.node);
+            let stagingVariants = existingProduct.variants.edges.map((e) => e.node);
+
+            console.log(
+              `Product ${product.title} has ${productionVariants.length} production variants and ${stagingVariants.length} staging variants`,
+            );
+
+            console.log(`Updating variant data (tracked, SKU, price, etc.) for existing product "${product.title}"...`);
+            const variantsUpdateResult = await updateProductVariantsInStaging(
+              existingProduct.id,
+              productionVariants,
+              stagingVariants,
+              stagingAdmin,
+            );
+
+            if (variantsUpdateResult.success) {
+              console.log(
+                `✅ Successfully updated ${variantsUpdateResult.variants?.length || 0} variants for "${product.title}"`,
+              );
+              // Update staging variants reference with fresh data from the bulk update
+              if (variantsUpdateResult.variants?.length > 0) {
+                stagingVariants = variantsUpdateResult.variants;
+                // Rebuild existingProduct.variants.edges with updated data
+                existingProduct.variants.edges = stagingVariants.map((v) => ({ node: v }));
+              }
+            } else {
+              console.error(
+                `⚠️ Failed to update variant data for "${product.title}": ${variantsUpdateResult.error}`,
+              );
+            }
+          }
+
           // Sync variant metafields and inventory for existing variants
           if (product.variants?.edges && existingProduct.variants?.edges) {
             console.log(
-              `Product ${product.title} has ${product.variants.edges.length} production variants and ${existingProduct.variants.edges.length} staging variants`,
+              `Syncing metafields and inventory for ${product.variants.edges.length} variants of "${product.title}"...`,
             );
 
             for (const variantEdge of product.variants.edges) {
@@ -2182,6 +2136,33 @@ export async function syncProducts(
                 console.log(
                   `Found matching staging variant: ${stagingVariant.node.title} (ID: ${stagingVariant.node.id})`,
                 );
+
+                // Fix 2E: Save variant and inventory_item mappings
+                if (storeConnectionId) {
+                  try {
+                    await saveMapping(storeConnectionId, "variant", {
+                      productionId: extractIdFromGid(variant.id),
+                      stagingId: extractIdFromGid(stagingVariant.node.id),
+                      productionGid: variant.id,
+                      stagingGid: stagingVariant.node.id,
+                      matchKey: "selectedOptions",
+                      matchValue: variant.selectedOptions?.map((o) => `${o.name}:${o.value}`).join("|"),
+                      title: variant.title,
+                    });
+                    if (variant.inventoryItem?.id && stagingVariant.node.inventoryItem?.id) {
+                      await saveMapping(storeConnectionId, "inventory_item", {
+                        productionId: extractIdFromGid(variant.inventoryItem.id),
+                        stagingId: extractIdFromGid(stagingVariant.node.inventoryItem.id),
+                        productionGid: variant.inventoryItem.id,
+                        stagingGid: stagingVariant.node.inventoryItem.id,
+                        matchKey: "variant_sku",
+                        matchValue: variant.sku || variant.title,
+                      });
+                    }
+                  } catch (mappingError) {
+                    console.warn(`⚠️ Failed to save variant/inventory mapping: ${mappingError.message}`);
+                  }
+                }
 
                 // Sync metafields if variant has any
                 if (variant.metafields?.nodes?.length > 0) {
@@ -2350,8 +2331,8 @@ export async function syncProducts(
             }
           }
 
-          // Publish the product so it appears on channels/storefront immediately
-          await publishProductToCurrentChannel(result.product.id, stagingAdmin);
+          // Publish the product to all available sales channels
+          await publishProductToAllChannels(result.product.id, stagingAdmin);
 
           // Sync product metafields after successful creation
           if (product.metafields?.nodes?.length > 0 && result.product?.id) {
@@ -2388,7 +2369,48 @@ export async function syncProducts(
           if (product.variants?.edges && result.product?.variants?.edges) {
             for (let j = 0; j < product.variants.edges.length; j++) {
               const variant = product.variants.edges[j].node;
-              const createdVariant = result.product.variants.edges[j];
+
+              // Match by selectedOptions instead of array index (Fix 2A)
+              const createdVariant = result.product.variants.edges.find(
+                (sv) => {
+                  const prodOptions = variant.selectedOptions
+                    ?.map((o) => `${o.name}:${o.value}`)
+                    .sort()
+                    .join("|");
+                  const stagingOptions = sv.node.selectedOptions
+                    ?.map((o) => `${o.name}:${o.value}`)
+                    .sort()
+                    .join("|");
+                  return prodOptions === stagingOptions;
+                },
+              );
+
+              // Fix 2E: Save variant and inventory_item mappings for new variants
+              if (storeConnectionId && createdVariant) {
+                try {
+                  await saveMapping(storeConnectionId, "variant", {
+                    productionId: extractIdFromGid(variant.id),
+                    stagingId: extractIdFromGid(createdVariant.node.id),
+                    productionGid: variant.id,
+                    stagingGid: createdVariant.node.id,
+                    matchKey: "selectedOptions",
+                    matchValue: variant.selectedOptions?.map((o) => `${o.name}:${o.value}`).join("|"),
+                    title: variant.title,
+                  });
+                  if (variant.inventoryItem?.id && createdVariant.node.inventoryItem?.id) {
+                    await saveMapping(storeConnectionId, "inventory_item", {
+                      productionId: extractIdFromGid(variant.inventoryItem.id),
+                      stagingId: extractIdFromGid(createdVariant.node.inventoryItem.id),
+                      productionGid: variant.inventoryItem.id,
+                      stagingGid: createdVariant.node.inventoryItem.id,
+                      matchKey: "variant_sku",
+                      matchValue: variant.sku || variant.title,
+                    });
+                  }
+                } catch (mappingError) {
+                  console.warn(`⚠️ Failed to save variant/inventory mapping: ${mappingError.message}`);
+                }
+              }
 
               if (variant.metafields?.nodes?.length > 0 && createdVariant) {
                 log.push({

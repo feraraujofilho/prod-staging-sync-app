@@ -191,13 +191,6 @@ async function updateProductMetafield(
         product {
           id
           title
-          metafield(namespace: "${namespace}", key: "${key}") {
-            id
-            namespace
-            key
-            value
-            type
-          }
         }
         userErrors {
           field
@@ -424,6 +417,18 @@ export async function syncSearchDiscoveryMetafields(
               timestamp: new Date().toISOString(),
               message: `✅ Successfully created/updated metafield ${metafield.namespace}.${metafield.key} on staging product`,
               success: true,
+            });
+          } else if (
+            updateResult.errors &&
+            (updateResult.errors.includes("does not exist") ||
+              updateResult.errors.includes("Product not found"))
+          ) {
+            // Product was mapped but no longer exists in staging (e.g. bundles, deleted products)
+            summary.skipped++;
+            log.push({
+              timestamp: new Date().toISOString(),
+              message: `⚠️ Skipped ${metafield.namespace}.${metafield.key} for ${productionProduct.title} - staging product no longer exists`,
+              warning: true,
             });
           } else {
             summary.failed++;

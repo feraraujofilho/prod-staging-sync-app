@@ -131,7 +131,7 @@ Tracks GID references that couldn't be mapped during sync.
 ### 1. Run Database Migration
 
 ```bash
-cd /Users/fernandoaraujo/Documents/repos/stag-2/app-staging
+cd shopify-store-sync
 npx prisma migrate dev --name add_resource_mapping_system
 ```
 

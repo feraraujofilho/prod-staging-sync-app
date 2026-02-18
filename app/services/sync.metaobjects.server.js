@@ -56,7 +56,7 @@ async function getMetaobjectDefinitions(store, token) {
   while (hasNextPage) {
     try {
       const response = await fetch(
-        `https://${store}/admin/api/2025-01/graphql.json`,
+        `https://${store}/admin/api/2025-07/graphql.json`,
         {
           method: "POST",
           headers: {
@@ -110,7 +110,9 @@ export async function getExistingStagingMetaobjectDefinitions(stagingAdmin) {
   `;
 
   try {
-    const response = await stagingAdmin.graphql(query);
+    const response = await stagingAdmin.graphql(query, {
+      variables: { cursor: null },
+    });
     const data = await response.json();
     return data.data.metaobjectDefinitions.edges.map((edge) => edge.node);
   } catch (error) {

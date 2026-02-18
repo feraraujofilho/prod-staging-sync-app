@@ -5,6 +5,11 @@ import { createReadableStreamFromReadable } from "@remix-run/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 
+// Initialize the sync scheduler (uses globalThis singleton to prevent duplicates)
+import("./services/scheduler.server")
+  .then(({ initScheduler }) => initScheduler())
+  .catch((err) => console.error("[Scheduler] Init failed:", err.message));
+
 export const streamTimeout = 5000;
 
 export default async function handleRequest(

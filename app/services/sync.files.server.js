@@ -1,4 +1,3 @@
-import { json } from "@remix-run/node";
 import { saveMapping, extractIdFromGid } from "./resource-mapping.server.js";
 
 /**
@@ -44,7 +43,7 @@ async function getProductionImageFiles(productionStore, accessToken) {
     `;
 
     const response = await fetch(
-      `https://${productionStore}/admin/api/2025-01/graphql.json`,
+      `https://${productionStore}/admin/api/2025-07/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -179,7 +178,7 @@ async function createFileInStaging(file, stagingAdmin) {
         contentType: "IMAGE",
         originalSource: file.image.url,
         filename: filename,
-        duplicateResolutionMode: "RAISE_ERROR", // Skip if filename exists
+        duplicateResolutionMode: "RAISE_ERROR", // Raises error on duplicate so we can detect and skip
       },
     ],
   };
